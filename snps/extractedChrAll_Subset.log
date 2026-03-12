@@ -1,0 +1,19 @@
+PLINK v2.0.0-a.6.9LM 64-bit Intel (29 Jan 2025)
+Options in effect:
+  --bfile Generative_Genomic_Data/data/BAQ/extractedChrAll_Subset
+  --export vcf
+  --out extractedChrAll_Subset
+
+Hostname: bio-compjord01.biosci.gatech.edu
+Working directory: /home/sverma87/Generative_Genomic_Data
+Start time: Wed Feb 25 11:18:32 2026
+
+Random number seed: 1772036312
+1546285 MiB RAM detected, ~1510876 available; reserving 773142 MiB for main
+workspace.
+Using up to 80 threads (change this with --threads).
+Error: Failed to open
+Generative_Genomic_Data/data/BAQ/extractedChrAll_Subset.fam : No such file or
+directory.
+
+End time: Wed Feb 25 11:18:32 2026
