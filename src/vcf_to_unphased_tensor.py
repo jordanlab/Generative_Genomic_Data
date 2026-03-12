@@ -1,6 +1,7 @@
 import allel
 import numpy as np
 import torch
+import pandas as pd
 
 def load_vcf(file_path) -> dict:
     '''
@@ -29,9 +30,9 @@ def create_unphased_tensor(callset: dict) -> torch.Tensor:
     # Else sum the two alleles to get the total count of alternate alleles (0, 1, or 2)
     unphased_tensor = torch.where(
         (gt_tensor[:, :, 0] == -1) | (gt_tensor[:, :, 1] == -1),
-        -1.0,
+        -1,
         gt_tensor[:, :, 0] + gt_tensor[:, :, 1]
-    )
+    ).to(torch.int)  # Convert to integer type
     
     unphsdr_tensor = torch.transpose(unphased_tensor, 1, 0)  # Transpose to shape (variants, samples)
     
@@ -39,7 +40,7 @@ def create_unphased_tensor(callset: dict) -> torch.Tensor:
 
 def main():
     # Example usage w/ BAQ Dataset
-    file_path = '/home/sverma87/Generative_Genomic_Data/data/BAQ/BAQ_qc2_grch38_final.vcf'
+    file_path = '/home/sverma87/Generative_Genomic_Data/data/BAQ/BAQ_qc2_grch38_final_qc.vcf'
     baq_vcf = load_vcf(file_path)
     baq_tensor = create_unphased_tensor(baq_vcf)
     
@@ -47,5 +48,19 @@ def main():
     print(f"First 5 samples (all variants) - 2D encoding:")
     print(baq_tensor[:5, :10])
     
+    # Extract SNP gnomAD IDs
+    baq_vcf['variants/ALT'] = baq_vcf['variants/ALT'][:, 0]  # Get the first alternate allele for each variant
+    snp_ids = 'chr' + baq_vcf['variants/CHROM'] + ':' + baq_vcf['variants/POS'].astype(str) + ':' + baq_vcf['variants/REF'] + ':' + baq_vcf['variants/ALT']
+
+    # Convert tensor to NumPy array
+    baq_tensor_np = baq_tensor.numpy()
+
+    # Create a DataFrame with SNP IDs as columns
+    df = pd.DataFrame(baq_tensor_np, columns=snp_ids)
+
+    # Save DataFrame to CSV
+    df.to_csv('/home/sverma87/Generative_Genomic_Data/data/BAQ/BAQ_unphased_tensor.csv', index=False)
+    print(f"CSV file saved with SNP IDs as columns.")
+
 if __name__ == "__main__":
     main()
