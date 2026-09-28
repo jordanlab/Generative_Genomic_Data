@@ -90,7 +90,7 @@ echo ""
 # Build command
 # ===========================================================================
 CMD="python -u src/conditional_wgan_pipeline.py \
-    --baq_input          ${BAQ_CSV} \
+    --data_input         ${BAQ_CSV} \
     --ref_input          ${REF_CSV} \
     --fam                ${FAM_FILE} \
     --n_synthetic        ${N_SYNTHETIC} \

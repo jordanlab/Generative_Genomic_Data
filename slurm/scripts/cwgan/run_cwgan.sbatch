@@ -30,7 +30,7 @@ $PY -c "import torch;print('torch',torch.__version__,'cuda',torch.cuda.is_availa
 
 cd "${SRC}" || exit 1
 $PY -u conditional_wgan_pipeline.py \
-    --baq_input  "${INPUT_CSV}" \
+    --data_input "${INPUT_CSV}" \
     --ref_input  "${REF_CSV}" \
     --fam        "${FAM}" \
     --n_synthetic ${N_SYNTHETIC} \

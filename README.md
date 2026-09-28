@@ -56,7 +56,7 @@ also gitignored — they are large and fully reproducible from the pipeline.
 
 ```bash
 python src/conditional_wgan_pipeline.py \
-    --baq_input      data/<COHORT>/<COHORT>_refintersect_qc_ldpruned_unphased_tensor.csv \
+    --data_input     data/<COHORT>/<COHORT>_refintersect_qc_ldpruned_unphased_tensor.csv \
     --ref_input      data/reference/extractedChrAll_<COHORT>_intersect_qc_ldpruned_unphased_tensor.csv \
     --fam            data/reference/extractedChrAll_common_snps_forReference.fam \
     --output         results/<COHORT>/cWGAN_gen-data/synthetic_genotypes_seed42.csv \

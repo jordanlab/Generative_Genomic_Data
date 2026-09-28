@@ -26,7 +26,7 @@ Pipeline:
 Usage:
     # Conservative first run (Dirichlet fitted to observed BAQ admixture):
     python conditional_wgan_pipeline.py \
-        --baq_input    data/BAQ/BAQ_qc2_grch38_final_qc_ldpruned_common_snps_unphased_tensor.csv \
+        --data_input   data/BAQ/BAQ_qc2_grch38_final_qc_ldpruned_common_snps_unphased_tensor.csv \
         --ref_input    data/reference/extractedChrAll_common_snps_forReference_qc_ldpruned_unphased_tensor.csv \
         --fam          data/reference/extractedChrAll_common_snps_forReference.fam
 
@@ -543,7 +543,7 @@ def _find_baq_vertices(baq_pcs: np.ndarray,
 # Main Pipeline
 # =============================================================================
 
-def run_pipeline(baq_input_path: str,
+def run_pipeline(data_input_path: str,
                  ref_input_path: str,
                  fam_path: str,
                  n_synthetic: int = 200,
@@ -562,8 +562,8 @@ def run_pipeline(baq_input_path: str,
     """Full conditional WGAN pipeline.
 
     Args:
-        baq_input_path:      BAQ genotype CSV (samples × SNPs).
-        ref_input_path:      Reference genotype CSV, same SNP columns as BAQ.
+        data_input_path:     Query population genotype CSV (samples × SNPs).
+        ref_input_path:      Reference genotype CSV, same SNP columns as query.
                              Must be QC-filtered and LD-pruned to match BAQ.
         fam_path:            PLINK .fam for reference samples (ancestry labels).
         target_admixture:    (3,) [AFR, EUR, AMR] summing to 1.  If None,
@@ -598,7 +598,7 @@ def run_pipeline(baq_input_path: str,
     # ------------------------------------------------------------------
     t0 = time.time()
     print("\n[1/7] Loading BAQ genotypes...", flush=True)
-    baq_df    = pd.read_csv(baq_input_path, header=0)
+    baq_df    = pd.read_csv(data_input_path, header=0)
     print(f"  BAQ: {baq_df.shape[0]} samples × {baq_df.shape[1]} SNPs  "
           f"[{_elapsed(t0)}]", flush=True)
 
@@ -866,10 +866,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Conditional WGAN-GP synthetic genotype generator"
     )
-    parser.add_argument("--baq_input",    required=True,
-                        help="BAQ genotype CSV (samples × SNPs)")
+    parser.add_argument("--data_input",   required=True,
+                        help="Query population genotype CSV (samples × SNPs)")
     parser.add_argument("--ref_input",    required=True,
-                        help="Reference genotype CSV — same SNP columns as BAQ, "
+                        help="Reference genotype CSV — same SNP columns as the "
+                             "query data, "
                              "QC-filtered and LD-pruned to match")
     parser.add_argument("--fam",          required=True,
                         help="PLINK .fam for reference samples (ancestry labels)")
@@ -913,7 +914,7 @@ if __name__ == "__main__":
             raise ValueError("--target_admixture must have exactly 3 values")
 
     run_pipeline(
-        baq_input_path      = args.baq_input,
+        data_input_path     = args.data_input,
         ref_input_path      = args.ref_input,
         fam_path            = args.fam,
         n_synthetic         = args.n_synthetic,

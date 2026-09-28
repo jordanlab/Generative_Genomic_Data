@@ -1298,7 +1298,7 @@ Lines 541–823
 ### Function signature and pre-flight
 
 ```python
-def run_pipeline(baq_input_path, ref_input_path, fam_path,
+def run_pipeline(data_input_path, ref_input_path, fam_path,
                  n_synthetic=200, output_path="synthetic_genotypes.csv",
                  plot_path="pca_overlay.png", n_components=50, seed=42,
                  target_admixture=None, alpha_concentration=20.0,
@@ -1340,7 +1340,7 @@ def run_pipeline(baq_input_path, ref_input_path, fam_path,
 ### Step 1 — Load BAQ Genotypes
 
 ```python
-    baq_df    = pd.read_csv(baq_input_path, header=0)
+    baq_df    = pd.read_csv(data_input_path, header=0)
     # Read the unphased tensor CSV.
     # header=0: first row is column names (SNP IDs like "rs12345")
     # Result: DataFrame where rows = samples, columns = SNPs, values = 0/1/2 dosages
@@ -1615,7 +1615,7 @@ Each `add_argument` call defines one CLI flag:
 
 | Flag | Type | Default | Meaning |
 |---|---|---|---|
-| `--baq_input` | str | required | Query population genotype CSV |
+| `--data_input` | str | required | Query population genotype CSV |
 | `--ref_input` | str | required | Reference panel genotype CSV |
 | `--fam` | str | required | PLINK .fam with ancestry labels |
 | `--n_synthetic` | int | 200 | Number of synthetic samples to generate |
@@ -1643,7 +1643,7 @@ Each `add_argument` call defines one CLI flag:
 
 ```python
     run_pipeline(
-        baq_input_path      = args.baq_input,
+        data_input_path      = args.data_input,
         # ... all parsed args forwarded to run_pipeline() ...
     )
 ```
