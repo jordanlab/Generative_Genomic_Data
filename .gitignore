@@ -16,3 +16,12 @@ __pycache__/
 # Environments
 ggd_env/
 *.egg-info/
+
+# src/ — cWGAN only. conditional_wgan_pipeline.py is the sole model script;
+# plot_colors.py is imported by it, and vcf_to_unphased_tensor.py builds its
+# input tensors (invoked by ref_preprocess/rebuild_reference.sbatch).
+# Other model and analysis scripts stay on disk but out of the repo.
+src/*
+!src/conditional_wgan_pipeline.py
+!src/plot_colors.py
+!src/vcf_to_unphased_tensor.py

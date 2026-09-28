@@ -33,20 +33,20 @@ resampling of the GAN output.
 
 ```
 src/
-  conditional_wgan_pipeline.py   # main cWGAN-GP pipeline (current)
-  pca_synthetic_pipeline.py      # earlier unconditional PCA+WGAN pipeline
-  evaluate_synthetic.py          # synthetic-vs-real evaluation metrics
-  vcf_to_unphased_tensor.py      # VCF -> additive dosage tensor
-  csv_dosage_to_plink.py         # dosage CSV -> PLINK binary
-  pca.py, pca_diagnostic.py      # PCA plotting and QC
-  realign_joint_pca.py           # joint-PCA realignment across panels
-  VAE/                           # earlier VAE experiments (FC, 1D-CNN, block)
+  conditional_wgan_pipeline.py   # the cWGAN-GP model — the only model script here
+  plot_colors.py                 # per-population colors; imported by the pipeline
+  vcf_to_unphased_tensor.py      # VCF -> additive dosage tensor (builds pipeline input)
 docs/
   pipeline_walkthrough.md        # line-by-line walkthrough of the cWGAN pipeline
 results/<COHORT>/
   cWGAN_PCA/                     # PCA overlay plots (committed)
   cWGAN_gen-data/                # synthetic genotype CSVs (gitignored — large)
 ```
+
+`src/` is deliberately scoped to the cWGAN pipeline. Earlier work — the
+unconditional PCA+WGAN pipeline, the VAE experiments, and the standalone PCA and
+evaluation scripts — is kept out of the repo via `.gitignore` rather than deleted,
+so it still exists in the original working tree.
 
 `data/`, `snps/`, and `slurm/` are gitignored: they hold raw VCFs, PLINK
 binaries, genotype tensors, SNP lists, and job logs. Synthetic genotype CSVs are
