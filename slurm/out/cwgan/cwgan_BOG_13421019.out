@@ -1,0 +1,75 @@
+---------------------------------------
+Begin Slurm Prolog: Sep-21-2026 19:20:12
+Job ID:    13421019
+User ID:   sverma87
+Account:   gts-jhamilton80
+Job name:  BOG
+Partition: gpu-rtx6000
+QOS:       inferno
+---------------------------------------
+=== BOG seed 42 | job 13421019 | atl1-1-03-006-1-0.pace.gatech.edu ===
+start Mon Sep 21 19:20:12 EDT 2026
+torch 2.5.1+cu121 cuda True
+
+[1/7] Loading BAQ genotypes...
+  BAQ: 337 samples × 45410 SNPs  [7.5s]
+
+[2/7] Loading reference genotypes + labels...
+  NOTE: aligning to 28514 shared SNPs  (dropped 16896 from BAQ, 32256 from ref).
+  query: imputed 15,804 missing genotypes (0.16%) to per-SNP means
+  reference: imputed 3,161 missing genotypes (0.02%) to per-SNP means
+  BAQ: 337 samples × 28514 SNPs
+  Reference: 644 samples × 28514 SNPs  [18.5s]
+  Labels: AFR=312  EUR=273  AMR=59
+
+[3/7] PCA compression (fit on reference)...
+  Input shape : 644 samples × 28514 SNPs
+  Retaining   : 50 PCs
+  Variance explained: 20.06%
+  PCA done  [1.2s]
+
+[4/7] Assigning admixture conditions...
+  Computing reference centroids...
+  AFR centroid (312 samples): PC1=+28.94  PC2=-0.80
+  EUR centroid (273 samples): PC1=-27.98  PC2=-11.14
+  AMR centroid ( 59 samples): PC1=-23.59  PC2=+55.82
+  BAQ mean admixture — AFR:0.060  EUR:0.587  AMR:0.353
+  Reference conditions assigned  [0.0s]
+  Combined training set: 981 samples
+
+[5/7] Training Conditional WGAN-GP...
+  cWGAN device    : cuda
+  Training data   : 981 samples × 50 PC dims
+  Cond dim        : 3
+  latent=32  hidden=[128, 256, 128]  epochs=1000  bs=64  n_critic=5  λ_gp=10.0
+  [cWGAN epoch   500/1000]  G=+6.4362  C=-2.5088  [191.7s]
+  [cWGAN epoch  1000/1000]  G=+7.6652  C=-2.5882  [382.1s]
+  cWGAN training complete  [382.1s]
+  Training done  [385.4s]
+
+[6/7] Generating 200 synthetic samples...
+  Mode: fitted BAQ Dirichlet  (α=[ 1.41 13.95  8.38], α0=23.75)
+  Sampling done  [0.0s]
+
+[7/7] Reconstructing and saving genotypes...
+  Synthetic shape: (200, 28514)  [0.4s]
+  Fixed SNPs: 0/28514 (0.0%)
+  Saved to: /storage/home/hcoda1/8/sverma87/ggd_results/BOG/synthetic_genotypes_seed42_13421019.csv
+  Plot saved: /storage/home/hcoda1/8/sverma87/ggd_results/BOG/pca_overlay_seed42_13421019.png
+
+  Total wall time: 418.5s
+exit=0  end Mon Sep 21 19:27:23 EDT 2026
+-rw-r--r--. 1 sverma87 pace-jhamilton80 150K Sep 21 19:27 /storage/home/hcoda1/8/sverma87/ggd_results/BOG/pca_overlay_seed42_13421019.png
+-rw-r--r--. 1 sverma87 pace-jhamilton80  12M Sep 21 19:27 /storage/home/hcoda1/8/sverma87/ggd_results/BOG/synthetic_genotypes_seed42_13421019.csv
+---------------------------------------
+Begin Slurm Epilog: Sep-21-2026 19:27:24
+Job ID:        13421019
+User ID:       sverma87
+Account:       gts-jhamilton80
+Job name:      BOG
+Resources:     cpu=2,gres/gpu:rtx_6000=1,mem=20G,node=1
+Rsrc Used:     cput=00:14:44,vmem=0,walltime=00:07:22,mem=1918872K,energy_used=0
+Partition:     gpu-rtx6000
+QOS:           inferno
+Nodes:         atl1-1-03-006-1-0
+---------------------------------------

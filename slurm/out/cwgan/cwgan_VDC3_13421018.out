@@ -1,0 +1,75 @@
+---------------------------------------
+Begin Slurm Prolog: Sep-21-2026 19:19:01
+Job ID:    13421018
+User ID:   sverma87
+Account:   gts-jhamilton80
+Job name:  VDC3
+Partition: gpu-rtx6000
+QOS:       inferno
+---------------------------------------
+=== VDC3 seed 42 | job 13421018 | atl1-1-03-007-3-0.pace.gatech.edu ===
+start Mon Sep 21 19:19:01 EDT 2026
+torch 2.5.1+cu121 cuda True
+
+[1/7] Loading BAQ genotypes...
+  BAQ: 24 samples × 6688 SNPs  [0.2s]
+
+[2/7] Loading reference genotypes + labels...
+  NOTE: aligning to 6688 shared SNPs  (dropped 0 from BAQ, 139 from ref).
+  query: imputed 76,443 missing genotypes (47.62%) to per-SNP means
+  reference: imputed 743 missing genotypes (0.02%) to per-SNP means
+  BAQ: 24 samples × 6688 SNPs
+  Reference: 644 samples × 6688 SNPs  [0.7s]
+  Labels: AFR=312  EUR=273  AMR=59
+
+[3/7] PCA compression (fit on reference)...
+  Input shape : 644 samples × 6688 SNPs
+  Retaining   : 50 PCs
+  Variance explained: 23.87%
+  PCA done  [0.6s]
+
+[4/7] Assigning admixture conditions...
+  Computing reference centroids...
+  AFR centroid (312 samples): PC1=+13.42  PC2=-0.18
+  EUR centroid (273 samples): PC1=-12.79  PC2=-5.40
+  AMR centroid ( 59 samples): PC1=-11.79  PC2=+25.96
+  BAQ mean admixture — AFR:0.427  EUR:0.379  AMR:0.194
+  Reference conditions assigned  [0.0s]
+  Combined training set: 668 samples
+
+[5/7] Training Conditional WGAN-GP...
+  cWGAN device    : cuda
+  Training data   : 668 samples × 50 PC dims
+  Cond dim        : 3
+  latent=32  hidden=[128, 256, 128]  epochs=1000  bs=64  n_critic=5  λ_gp=10.0
+  [cWGAN epoch   500/1000]  G=+4.9239  C=-2.4399  [147.6s]
+  [cWGAN epoch  1000/1000]  G=+7.3758  C=-2.5410  [296.2s]
+  cWGAN training complete  [296.2s]
+  Training done  [301.9s]
+
+[6/7] Generating 200 synthetic samples...
+  Mode: fitted BAQ Dirichlet  (α=[7.11 6.31 3.23], α0=16.65)
+  Sampling done  [0.0s]
+
+[7/7] Reconstructing and saving genotypes...
+  Synthetic shape: (200, 6688)  [0.1s]
+  Fixed SNPs: 1/6688 (0.0%)
+  Saved to: /storage/home/hcoda1/8/sverma87/ggd_results/VDC3/synthetic_genotypes_seed42_13421018.csv
+  Plot saved: /storage/home/hcoda1/8/sverma87/ggd_results/VDC3/pca_overlay_seed42_13421018.png
+
+  Total wall time: 304.5s
+exit=0  end Mon Sep 21 19:24:26 EDT 2026
+-rw-r--r--. 1 sverma87 pace-jhamilton80 128K Sep 21 19:24 /storage/home/hcoda1/8/sverma87/ggd_results/VDC3/pca_overlay_seed42_13421018.png
+-rw-r--r--. 1 sverma87 pace-jhamilton80 2.7M Sep 21 19:24 /storage/home/hcoda1/8/sverma87/ggd_results/VDC3/synthetic_genotypes_seed42_13421018.csv
+---------------------------------------
+Begin Slurm Epilog: Sep-21-2026 19:24:26
+Job ID:        13421018
+User ID:       sverma87
+Account:       gts-jhamilton80
+Job name:      VDC3
+Resources:     cpu=2,gres/gpu:rtx_6000=1,mem=20G,node=1
+Rsrc Used:     cput=00:11:02,vmem=0,walltime=00:05:31,mem=1341696K,energy_used=0
+Partition:     gpu-rtx6000
+QOS:           inferno
+Nodes:         atl1-1-03-007-3-0
+---------------------------------------

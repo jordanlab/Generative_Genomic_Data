@@ -1,0 +1,97 @@
+---------------------------------------
+Begin Slurm Prolog: Jun-12-2026 14:16:36
+Job ID:    9870682
+User ID:   sverma87
+Account:   gts-jhamilton80
+Job name:  cwgan
+Partition: gpu-v100
+QOS:       inferno
+---------------------------------------
+==============================================
+Conditional WGAN-GP  —  VDC2 Dataset
+SLURM Job  : 9870682
+Node       : atl1-1-02-006-31-0.pace.gatech.edu
+Start time : Fri Jun 12 14:16:36 EDT 2026
+==============================================
+Input CSV   : /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/data/VDC2/VDC2_qc2_grch38_final_qc_ldpruned_unphased_tensor.csv
+Ref input   : /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/data/reference/extractedChrAll_common_snps_forReference_qc_ldpruned_unphased_tensor.csv
+FAM file    : /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/data/reference/extractedChrAll_common_snps_forReference.fam
+Target admix: BAQ-fitted Dirichlet (conservative)
+Seed        : 46
+
+Python : /storage/scratch1/8/sverma87/conda-envs/GGD_gpu_env/bin/python
+PyTorch: 2.6.0+cu124
+CUDA   : True
+
+Running: python -u src/conditional_wgan_pipeline.py     --baq_input          /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/data/VDC2/VDC2_qc2_grch38_final_qc_ldpruned_unphased_tensor.csv     --ref_input          /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/data/reference/extractedChrAll_common_snps_forReference_qc_ldpruned_unphased_tensor.csv     --fam                /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/data/reference/extractedChrAll_common_snps_forReference.fam     --n_synthetic        100     --output             /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/results/VDC2/cWGAN_gen-data/synthetic_genotypes_seed46.csv     --plot               /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/results/VDC2/cWGAN_PCA/pca_overlay_seed46.png     --n_components       50     --seed               46     --wgan_epochs        3000     --wgan_latent_dim    32     --batch_size         64     --alpha_concentration 20.0     --sample_name        VDC2     --real_color         "#FFFF00"
+
+
+[1/7] Loading BAQ genotypes...
+  BAQ: 114 samples × 98871 SNPs  [9.4s]
+
+[2/7] Loading reference genotypes + labels...
+  NOTE: aligning to 51543 shared SNPs  (dropped 47328 from BAQ, 67952 from ref).
+  BAQ: 114 samples × 51543 SNPs
+  Reference: 644 samples × 51543 SNPs  [106.8s]
+  Labels: AFR=312  EUR=273  AMR=59
+
+[3/7] PCA compression (fit on reference)...
+  Input shape : 644 samples × 51543 SNPs
+  Retaining   : 50 PCs
+  Variance explained: 22.94%
+  PCA done  [14.0s]
+
+[4/7] Assigning admixture conditions...
+  Computing reference centroids...
+  AFR centroid (312 samples): PC1=-39.29  PC2=+0.49
+  EUR centroid (273 samples): PC1=+37.52  PC2=+12.55
+  AMR centroid ( 59 samples): PC1=+34.18  PC2=-60.65
+  [INFO] Flipped PC1 sign for consistent orientation (AFR→positive PC1)
+  BAQ mean admixture — AFR:0.212  EUR:0.507  AMR:0.281
+  Reference conditions assigned  [0.0s]
+  Combined training set: 758 samples
+
+[5/7] Training Conditional WGAN-GP...
+  cWGAN device    : cuda
+  Training data   : 758 samples × 50 PC dims
+  Cond dim        : 3
+  latent=32  hidden=[128, 256, 128]  epochs=3000  bs=64  n_critic=5  λ_gp=10.0
+  [cWGAN epoch   500/3000]  G=-0.1322  C=-2.5731  [157.2s]
+  [cWGAN epoch  1000/3000]  G=+3.3043  C=-2.7372  [304.3s]
+  [cWGAN epoch  1500/3000]  G=+3.9184  C=-2.8585  [463.1s]
+  [cWGAN epoch  2000/3000]  G=+5.4426  C=-2.8987  [606.0s]
+  [cWGAN epoch  2500/3000]  G=+5.9147  C=-2.9045  [760.8s]
+  [cWGAN epoch  3000/3000]  G=+5.7581  C=-2.8446  [904.3s]
+  cWGAN training complete  [904.3s]
+  Training done  [907.0s]
+
+[6/7] Generating 100 synthetic samples...
+  Mode: fitted BAQ Dirichlet  (α=[0.96 2.29 1.27], α0=4.53)
+  Sampling done  [0.0s]
+
+[7/7] Reconstructing and saving genotypes...
+  Synthetic shape: (100, 51543)  [0.6s]
+  Fixed SNPs: 694/51543 (1.3%)
+  Saved to: /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/results/VDC2/cWGAN_gen-data/synthetic_genotypes_seed46_9870682.csv
+  Plot saved: /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/results/VDC2/cWGAN_PCA/pca_overlay_seed46_9870682.png
+
+  Total wall time: 1047.6s
+
+==============================================
+End time  : Fri Jun 12 14:34:19 EDT 2026
+Exit code : 0
+==============================================
+-rw-r--r--. 1 sverma87 pace-jhamilton80 11M Jun 12 14:34 /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/results/VDC2/cWGAN_gen-data/synthetic_genotypes_seed46_9870682.csv
+-rw-r--r--. 1 sverma87 pace-jhamilton80 103K Jun 12 14:34 /storage/home/hcoda1/8/sverma87/scratch/Generative_Genomic_Data/results/VDC2/cWGAN_PCA/pca_overlay_seed46_9870682.png
+---------------------------------------
+Begin Slurm Epilog: Jun-12-2026 14:34:20
+Job ID:        9870682
+User ID:       sverma87
+Account:       gts-jhamilton80
+Job name:      cwgan
+Resources:     cpu=8,gres/gpu:v100=1,mem=64G,node=1
+Rsrc Used:     cput=02:22:48,vmem=0,walltime=00:17:51,mem=5735456K,energy_used=0
+Partition:     gpu-v100
+QOS:           inferno
+Nodes:         atl1-1-02-006-31-0
+---------------------------------------
