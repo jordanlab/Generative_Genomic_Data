@@ -15,17 +15,20 @@ variance retained, per-epoch losses, admixture fit, and output paths.
 | Cohort | Job ID | Log | Seed |
 |--------|--------|-----|------|
 | ATQ3 | 10076013 | `out/cwgan/cwgan_ATQ3_10076013.out` | 42 |
-| COR  | 9870696  | `out/cwgan/cwgan_cwgan_9870696.out` | 46 |
-| VDC2 | 9870682  | `out/cwgan/cwgan_cwgan_9870682.out` | 46 |
+| COR  | 9870696  | `out/cwgan/cwgan_COR_9870696.out` | 46 |
+| VDC2 | 9870682  | `out/cwgan/cwgan_VDC2_9870682.out` | 46 |
 | BOG  | 13421019 | `out/cwgan/cwgan_BOG_13421019.out`  | 42 |
 | SAI  | 13421402 | `out/cwgan/cwgan_SAI_13421402.out`  | 45 |
 | UKB  | 13421020 | `out/cwgan/cwgan_UKB_13421020.out`  | 42 |
 | VDC3 | 13421018 | `out/cwgan/cwgan_VDC3_13421018.out` | 42 |
 | BAQ  | 9398110  | **not retained — see below**        | 2024 |
 
-The COR and VDC2 logs are named `cwgan_cwgan_*` because those jobs were
-submitted with a generic `--job-name`. The cohort is confirmed inside each file
-on the `Conditional WGAN-GP — <COHORT> Dataset` line.
+Every log follows `cwgan_<COHORT>_<JOBID>.out`. The COR and VDC2 jobs were
+originally submitted with a generic `--job-name`, so Slurm wrote them as
+`cwgan_cwgan_<JOBID>.out`; they have been renamed here for consistency. If you
+cross-reference against `sacct`, those two still report a JobName of `cwgan`.
+The cohort is stated inside each file on the
+`Conditional WGAN-GP — <COHORT> Dataset` line and in its `--sample_name` flag.
 
 ### The missing BAQ log
 
