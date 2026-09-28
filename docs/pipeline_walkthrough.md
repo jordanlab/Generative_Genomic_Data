@@ -1,0 +1,1356 @@
+# Conditional WGAN-GP Pipeline — Complete Line-by-Line Walkthrough
+**File:** `src/conditional_wgan_pipeline.py`  
+**Purpose:** This document explains every function, class, and architectural decision
+in the pipeline, written for thesis-level understanding.
+
+---
+
+## Table of Contents
+1. [Module Docstring & High-Level Architecture](#1-module-docstring--high-level-architecture)
+2. [Imports](#2-imports)
+3. [Utility Function: `_elapsed`](#3-utility-function-_elapsed)
+4. [Population Helpers](#4-population-helpers)
+5. [Barycentric Projection: `_simplex_project_batch`](#5-barycentric-projection-_simplex_project_batch)
+6. [Reference Centroids: `_ref_centroids`](#6-reference-centroids-_ref_centroids)
+7. [BAQ Admixture Estimation: `estimate_baq_admixture`](#7-baq-admixture-estimation-estimate_baq_admixture)
+8. [Conditional Generator: `_CondNetG`](#8-conditional-generator-_condnetg)
+9. [Conditional Critic: `_CondNetC`](#9-conditional-critic-_condnetc)
+10. [ConditionalWGAN: The Training Engine](#10-conditionalwgan-the-training-engine)
+11. [PCA Compression: `PCACompressor`](#11-pca-compression-pcacompressor)
+12. [Genotype Discretization: `discretize_genotypes`](#12-genotype-discretization-discretize_genotypes)
+13. [Inference Admixture Sampling: `sample_target_admixture`](#13-inference-admixture-sampling-sample_target_admixture)
+14. [PCA Overlay Plot: `plot_pca_overlay`](#14-pca-overlay-plot-plot_pca_overlay)
+15. [BAQ Vertex Finder: `_find_baq_vertices`](#15-baq-vertex-finder-_find_baq_vertices)
+16. [Main Pipeline: `run_pipeline`](#16-main-pipeline-run_pipeline)
+    - [Step 1 — Load BAQ Genotypes](#step-1--load-baq-genotypes)
+    - [Step 2 — Load Reference Genotypes + Labels](#step-2--load-reference-genotypes--labels)
+    - [Step 3 — PCA Compression](#step-3--pca-compression)
+    - [Step 4 — Admixture Conditions + PC1 Sign Fix](#step-4--admixture-conditions--pc1-sign-fix)
+    - [Step 5 — Train Conditional WGAN-GP](#step-5--train-conditional-wgan-gp)
+    - [Step 6 — Inference / Sampling](#step-6--inference--sampling)
+    - [Step 7 — Inverse PCA, Discretize, Save](#step-7--inverse-pca-discretize-save)
+17. [CLI (`__main__` block)](#17-cli-__main__-block)
+
+---
+
+## 1. Module Docstring & High-Level Architecture
+
+```
+Lines 1–35
+```
+
+The docstring describes the full intent: generate synthetic diploid genotypes for
+a Colombian population (or any target admixture profile) using a **Conditional
+Wasserstein GAN with Gradient Penalty (cWGAN-GP)**.
+
+The pipeline has seven sequential stages:
+```
+Load BAQ + Reference CSVs
+→ Fit PCA on reference
+→ Project both datasets into PC space
+→ Assign admixture conditions
+→ Train Conditional WGAN-GP
+→ Sample with target admixture proportions
+→ Inverse PCA → discretize → save
+```
+
+**Why PC space?**  
+Genotypes typically have ~70,000–120,000 SNPs. Training a neural network directly
+on that dimensionality would require an enormous model and enormous GPU memory.
+PCA reduces the data to 50 latent dimensions while retaining >80% of population
+variance — the WGAN trains on these compact representations, then the decoder
+(inverse PCA) maps them back to full SNP space.
+
+**Why conditional?**  
+Admixed individuals (e.g. Colombians) sit at various points in a triangle whose
+corners are African (AFR), European (EUR), and Amerindian (AMR) ancestries.
+Conditioning the generator on a 3-vector [AFR, EUR, AMR] lets you control where
+in that triangle the synthetic samples land. Without conditioning, you'd produce
+samples spread across all ancestries with no control over the output.
+
+---
+
+## 2. Imports
+
+```python
+Lines 37–47
+```
+
+```python
+import argparse          # CLI argument parsing — translates command-line flags into Python variables
+import os                # File and path operations (makedirs, path joins, env vars)
+import time              # Wall-clock timing for progress reporting
+import numpy as np       # Numerical arrays — all matrices live here
+import pandas as pd      # CSV I/O — reading genotype matrices and saving outputs
+import torch             # PyTorch — the deep learning framework for WGAN-GP
+import torch.nn as nn    # Neural network building blocks (Linear, LayerNorm, LeakyReLU, Sequential)
+from torch.utils.data import DataLoader, TensorDataset
+                         # DataLoader: batches data for training loops
+                         # TensorDataset: wraps (X, C) tensor pairs into an iterable dataset
+from sklearn.decomposition import PCA
+                         # Scikit-learn's PCA — dimensionality reduction
+import matplotlib.pyplot as plt
+                         # Plotting — generates the PCA overlay PNG
+from abc import ABC, abstractmethod
+                         # Abstract base class machinery — imported but not used in this file;
+                         # likely a leftover from shared code with pca_synthetic_pipeline.py
+```
+
+**Key design choice:** PyTorch (not TensorFlow/Keras) is used throughout because:
+1. Dynamic computation graphs make the gradient penalty easy to compute per-sample
+2. PACE HPC has CUDA-enabled V100 GPUs that PyTorch exposes through `torch.cuda`
+
+---
+
+## 3. Utility Function: `_elapsed`
+
+```python
+Lines 50–51
+```
+
+```python
+def _elapsed(t0: float) -> str:
+    return f"{time.time() - t0:.1f}s"
+```
+
+Tiny helper. `time.time()` returns wall time in seconds since epoch.
+Subtracting `t0` (a checkpoint recorded earlier) gives elapsed seconds.
+Used repeatedly in the pipeline for progress timing, e.g.:
+```
+PCA done  [12.3s]
+```
+
+---
+
+## 4. Population Helpers
+
+```python
+Lines 57–88
+```
+
+### `_POP_TO_SUPERPOP` dictionary (lines 58–66)
+
+```python
+_POP_TO_SUPERPOP = {
+    'ESN': 'AFR', 'GWD': 'AFR', 'YRI': 'AFR',     # West African populations (1000 Genomes)
+    'GBR': 'EUR', 'IBS': 'EUR', 'TSI': 'EUR',       # European populations
+    'Kar': 'AMR', 'Karitiana': 'AMR',               # Amerindian: Karitiana (Brazil)
+    'May': 'AMR', 'Maya':      'AMR',               # Amerindian: Maya (Mexico)
+    'PEL': 'AMR',                                   # Amerindian: Peruvians
+    'Pim': 'AMR', 'Pima':  'AMR',                   # Amerindian: Pima (Mexico/US)
+    'Sur': 'AMR', 'Surui': 'AMR',                   # Amerindian: Suruí (Brazil)
+}
+```
+
+Maps the individual population codes found in the PLINK `.fam` file to the three
+superpopulation groups the model reasons about. Short and long forms of the same
+population are both included because `.fam` files can use either.
+
+### `_SUPERPOPS` (line 67)
+
+```python
+_SUPERPOPS = ['AFR', 'EUR', 'AMR']
+```
+
+The canonical ordering of superpopulations throughout the entire script.
+**Order matters** — the admixture vector is always [AFR, EUR, AMR] and every
+function that indexes positions 0, 1, 2 assumes this ordering.
+
+### `_POP_COLORS` (lines 69–73)
+
+```python
+_POP_COLORS = {
+    'AFR': '#2166AC',   # Blue
+    'EUR': '#E87D00',   # Orange
+    'AMR': '#89CFF0',   # Light blue
+}
+```
+
+Hex colors for the PCA scatter plot. Kept in one place so every scatter call
+uses the same color for the same ancestry group — visual consistency across plots.
+
+### `load_population_labels(fam_path)` (lines 76–88)
+
+```python
+def load_population_labels(fam_path: str) -> list:
+    labels = []
+    with open(fam_path) as fh:
+        for line in fh:
+            cols = line.strip().split()      # Split on whitespace
+            if not cols:
+                continue                    # Skip blank lines
+            iid = cols[1]                   # Column 1 in .fam = Individual ID (IID)
+```
+
+PLINK `.fam` format has 6 columns per row:
+```
+FamilyID  IndividualID  PaternalID  MaternalID  Sex  Phenotype
+```
+Column index `[1]` is the Individual ID, which encodes the population code.
+
+```python
+            prefix = 'forReference'
+            pop_code = (iid[len(prefix):].split('_')[0]
+                        if iid.startswith(prefix) else iid.split('_')[0])
+```
+
+The reference samples were named `forReferenceESN_001`, `forReferenceGBR_042`, etc.
+- If the IID starts with `'forReference'`, strip that prefix, then split on `_`
+  and take the first token → `'ESN'`, `'GBR'`, etc.
+- If it doesn't start with that prefix (unknown format), just split on `_` and
+  take the first token.
+
+```python
+            labels.append(_POP_TO_SUPERPOP.get(pop_code, 'OTHER'))
+```
+
+Look up the population code in the dictionary. If not found, assign `'OTHER'`
+(these samples get a uniform [1/3, 1/3, 1/3] condition during training — see
+Step 4 — so they neither help nor hurt meaningfully).
+
+**Return:** A Python list of strings (`'AFR'`, `'EUR'`, `'AMR'`, or `'OTHER'`),
+one per row in the `.fam` file. Length must equal the number of reference samples.
+
+---
+
+## 5. Barycentric Projection: `_simplex_project_batch`
+
+```python
+Lines 91–106
+```
+
+This is the mathematical core of admixture estimation. Given a sample's position
+in PC space and the three reference centroids (corners of the ancestry triangle),
+it finds the closest point on the triangle and returns the corresponding weights.
+
+**The geometry:** Every point in a 2D plane can be expressed as a weighted sum of
+three non-collinear points (barycentric coordinates):
+```
+P = α·A + β·B + γ·C    where α + β + γ = 1
+```
+Here A=AFR centroid, B=EUR centroid, C=AMR centroid, and the weights [α, β, γ]
+are the admixture proportions.
+
+**Why it works in 50D:** PCA produces a 50-dimensional PC space, but the three
+ancestry groups form a roughly 2D manifold (a triangle) within it. The math
+generalizes perfectly to high dimensions — the triangle is still a 2-simplex.
+
+```python
+def _simplex_project_batch(pc_scores: np.ndarray,
+                            vertices: np.ndarray) -> np.ndarray:
+    v0, v1, v2 = vertices[0], vertices[1], vertices[2]
+    # v0 = AFR centroid (shape: n_components,)
+    # v1 = EUR centroid
+    # v2 = AMR centroid
+```
+
+```python
+    # The constraint α+β+γ=1 lets us eliminate γ:
+    # P = α·v0 + β·v1 + (1-α-β)·v2
+    # → (P - v2) = α·(v0-v2) + β·(v1-v2)
+    # This is a standard linear system: X = A @ [α, β]^T
+    A   = np.column_stack([v0 - v2, v1 - v2])   # shape (n_components, 2)
+    X   = pc_scores - v2                          # shape (n_samples, n_components)
+```
+
+`A` is a (50, 2) matrix whose columns are the two edge vectors of the triangle.
+`X` is every sample's position relative to the AMR corner.
+
+```python
+    ATA = A.T @ A                                 # (2, 2) — the normal equations matrix
+    XA  = X @ A                                   # (n_samples, 2) — projections onto edges
+    alpha01 = np.linalg.solve(ATA, XA.T).T        # (n_samples, 2) — AFR and EUR proportions
+```
+
+This is an **ordinary least-squares** solution. In OLS, the solution to `min ||Ax - b||²`
+is `x = (A^T A)^{-1} A^T b`. Here we solve for all samples at once:
+- `np.linalg.solve(ATA, XA.T)` solves the 2×2 linear system for each sample simultaneously
+- The `.T` at the end transposes back so rows = samples
+
+```python
+    alpha2  = 1.0 - alpha01[:, 0] - alpha01[:, 1]  # AMR proportion from the simplex constraint
+    return np.column_stack([alpha01, alpha2[:, np.newaxis]])
+    # Returns (n_samples, 3) — each row: [AFR_weight, EUR_weight, AMR_weight]
+```
+
+**Important:** Because the projection is pure least-squares (no constraint that
+weights must be positive), samples that fall *outside* the triangle get negative
+weights. These are clipped to zero in `estimate_baq_admixture` (see below).
+
+---
+
+## 6. Reference Centroids: `_ref_centroids`
+
+```python
+Lines 109–124
+```
+
+```python
+def _ref_centroids(ref_pcs: np.ndarray, pop_labels: list) -> np.ndarray:
+    labels   = np.array(pop_labels)     # Convert list to array for boolean indexing
+    vertices = []
+    for sp in _SUPERPOPS:               # Iterate: AFR, EUR, AMR (in that order)
+        mask     = labels == sp         # Boolean mask: True for samples of this ancestry
+        centroid = ref_pcs[mask].mean(axis=0)   # Mean PC position across all samples of this group
+        vertices.append(centroid)
+        print(f"  {sp} centroid ({mask.sum():>3d} samples): "
+              f"PC1={centroid[0]:+.2f}  PC2={centroid[1]:+.2f}", flush=True)
+    return np.array(vertices, dtype=np.float32)   # Shape: (3, n_components) = (3, 50)
+```
+
+The centroid of each superpopulation in PC space is simply the component-wise
+mean of all samples belonging to that group. These three points — the "poles"
+of the ancestry triangle — are what `_simplex_project_batch` uses as its vertices.
+
+**Why fit PCA on reference and use centroids?** The reference panel contains
+individuals with known, near-pure ancestries (e.g. Yoruba for AFR, British for EUR).
+Their cloud of PC positions in PCA space defines the extreme corners. Admixed
+individuals (BAQ/COR) fall *inside* this triangle proportionally to their ancestry.
+
+---
+
+## 7. BAQ Admixture Estimation: `estimate_baq_admixture`
+
+```python
+Lines 127–139
+```
+
+```python
+def estimate_baq_admixture(baq_pcs: np.ndarray,
+                            ref_centroids: np.ndarray) -> np.ndarray:
+    bary = _simplex_project_batch(baq_pcs, ref_centroids)
+    # bary shape: (n_baq, 3) — raw barycentric weights, may include negatives
+```
+
+```python
+    # Samples outside the triangle get negative weights (geometrically valid
+    # but meaningless as "proportions").  Clip and renormalise.
+    bary = np.clip(bary, 0.0, None)              # Set negatives to zero
+    bary /= bary.sum(axis=1, keepdims=True)      # Normalise rows to sum to 1
+    return bary.astype(np.float32)               # (n_baq, 3) simplex coordinates
+```
+
+This turns raw geometric projections into valid probability vectors.
+`keepdims=True` preserves the 2D shape so broadcasting divides each row by
+its own sum (not the total sum).
+
+**Result:** For each BAQ sample, a vector like [0.55, 0.32, 0.13] meaning
+"55% AFR, 32% EUR, 13% AMR" — this becomes the **conditioning vector c** used
+during training and inference.
+
+---
+
+## 8. Conditional Generator: `_CondNetG`
+
+```python
+Lines 146–169
+```
+
+The generator is a Multi-Layer Perceptron (MLP) that maps a noise+condition pair
+to a synthetic PC score vector.
+
+### Constructor
+
+```python
+class _CondNetG(nn.Module):
+    def __init__(self, latent_dim: int, cond_dim: int,
+                 hidden_dims: list, output_dim: int):
+        super().__init__()                   # Must call nn.Module's __init__
+        layers, prev = [], latent_dim + cond_dim
+        # prev tracks the input width of the next layer, starting at 32+3=35
+```
+
+```python
+        for h in hidden_dims:                # hidden_dims = [128, 256, 128]
+            layers += [nn.Linear(prev, h),   # Fully-connected layer: prev → h units
+                       nn.LayerNorm(h),      # Normalise within a single sample (not across batch)
+                       nn.LeakyReLU(0.2, inplace=True)]  # Activation: f(x) = max(0.2x, x)
+            prev = h                         # Update input width for next iteration
+        layers.append(nn.Linear(prev, output_dim))   # Final layer: 128 → 50 (no activation)
+        self.net = nn.Sequential(*layers)    # Chain all layers into one callable module
+```
+
+**Architecture:** 35 → 128 → 256 → 128 → 50
+
+**Why LayerNorm (not BatchNorm)?**  
+BatchNorm normalises using the *batch* mean and variance — it couples samples
+within a mini-batch. During the gradient penalty step, we need independent
+per-sample gradients. BatchNorm breaks this by sharing statistics. LayerNorm
+normalises using *per-sample* statistics, so each sample is treated independently.
+
+**Why LeakyReLU(0.2)?**  
+Standard ReLU kills negative activations completely (gradient=0). In GAN training,
+dead neurons in the generator lead to "mode collapse" where the generator produces
+only a few outputs. Leaky ReLU with slope 0.2 for negatives keeps gradients alive
+throughout training.
+
+### Forward pass
+
+```python
+    def forward(self, z: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([z, c], dim=1))
+        # torch.cat([z, c], dim=1): concatenates along the feature axis
+        # z shape: (batch, 32) — random noise
+        # c shape: (batch, 3)  — admixture condition
+        # combined: (batch, 35) — fed into the network
+```
+
+Concatenation is the standard method for conditioning MLPs. The network sees both
+the random noise (source of variation) and the condition (ancestry constraint)
+simultaneously from the very first layer.
+
+---
+
+## 9. Conditional Critic: `_CondNetC`
+
+```python
+Lines 172–195
+```
+
+The critic scores how "real" a given (sample, condition) pair looks.
+
+```python
+class _CondNetC(nn.Module):
+    def __init__(self, input_dim: int, cond_dim: int, hidden_dims: list):
+        super().__init__()
+        layers, prev = [], input_dim + cond_dim
+        # prev = 50 + 3 = 53 — the PC scores plus the ancestry condition
+```
+
+```python
+        for h in hidden_dims:
+            layers += [nn.Linear(prev, h),
+                       nn.LeakyReLU(0.2, inplace=True)]
+            # No LayerNorm here — LayerNorm would interfere with the gradient penalty
+            prev = h
+        layers.append(nn.Linear(prev, 1))   # Output: a single scalar (Wasserstein score)
+        self.net = nn.Sequential(*layers)
+```
+
+**Architecture:** 53 → 128 → 256 → 128 → 1
+
+**Key difference from the generator:** No LayerNorm (not even LayerNorm). The
+gradient penalty (see below) requires computing `||∇C(x̂)||` — the norm of the
+critic's gradient with respect to an interpolated input. Any normalisation that
+uses batch or layer statistics can distort these gradients. The critic must be
+a pure function of its input, sample by sample.
+
+**No sigmoid on output:** Unlike standard GAN discriminators (which output 0–1
+probability), the WGAN critic outputs an *unbounded real number*. Higher = "more
+real-looking." This is the Wasserstein distance estimate — it's more stable to
+train because it doesn't saturate.
+
+```python
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([x, c], dim=1))
+        # x shape: (batch, 50) — PC scores (real or fake)
+        # c shape: (batch, 3)  — admixture condition
+        # combined: (batch, 53) → scalar score
+```
+
+Why condition the critic on c? Without it, the critic would only learn "does this
+look like a real PC score in general?" — not "does this look like a real PC score
+*for a sample with this ancestry*?" Conditioning forces the critic to evaluate
+realism within the correct ancestry context.
+
+---
+
+## 10. ConditionalWGAN: The Training Engine
+
+```python
+Lines 198–359
+```
+
+### Constructor (lines 206–229)
+
+```python
+class ConditionalWGAN:
+    def __init__(self,
+                 latent_dim:  int   = 32,    # Dimensionality of noise vector z
+                 cond_dim:    int   = 3,     # Dimensionality of condition c (AFR/EUR/AMR)
+                 hidden_dims: list  = None,  # MLP layer widths [128, 256, 128]
+                 n_epochs:    int   = 3000,  # Training iterations over the full dataset
+                 batch_size:  int   = 64,    # Samples per gradient step
+                 lr:          float = 1e-4,  # Adam learning rate
+                 n_critic:    int   = 5,     # Critic updates per generator update
+                 lambda_gp:   float = 10.0, # Weight of the gradient penalty
+                 device:      str   = None, # 'cuda' / 'cpu' — auto-detected if None
+                 seed:        int   = 42,
+                 log_every:   int   = 500): # Print loss every N epochs
+```
+
+```python
+        self.hidden_dims = hidden_dims or [128, 256, 128]
+        # ...stores all hyperparameters as instance variables...
+        self._G = self._C = self._device = None   # Populated during fit()
+        self._mean = self._std = None             # PC score normalisation statistics
+```
+
+### Device resolution (lines 232–235)
+
+```python
+    def _resolve_device(self) -> torch.device:
+        if self.device_str:
+            return torch.device(self.device_str)   # User-specified
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Automatically uses GPU if available, CPU otherwise
+```
+
+### Gradient Penalty (lines 237–250)
+
+This is the mathematical heart of WGAN-**GP** (the GP stands for gradient penalty).
+
+**Background:** Standard GANs enforce the Lipschitz constraint on the critic via
+weight clipping — crude and prone to vanishing gradients. WGAN-GP instead *penalises*
+any violation of the Lipschitz condition directly in the loss function.
+
+The Lipschitz-1 condition requires: `||∇C(x)|| ≤ 1` everywhere.
+Rather than checking everywhere (impossible), the paper samples interpolated
+points between real and fake samples and enforces the constraint there.
+
+```python
+    def _gradient_penalty(self, real, fake, cond):
+        n     = real.size(0)                              # Batch size
+        alpha = torch.rand(n, 1, device=self._device).expand_as(real)
+        # alpha: (n, 1) uniform random scalars, broadcast to (n, 50)
+        # Each sample in the batch gets its own random interpolation weight
+```
+
+```python
+        interp = (alpha * real + (1.0 - alpha) * fake).requires_grad_(True)
+        # interp[i] = alpha[i] * real[i] + (1-alpha[i]) * fake[i]
+        # A random convex combination of each real/fake pair
+        # requires_grad_(True): tells PyTorch to track gradients w.r.t. this tensor
+```
+
+```python
+        grads = torch.autograd.grad(
+            outputs=self._C(interp, cond),  # Critic's score at the interpolated point
+            inputs=interp,                  # Differentiate w.r.t. the interpolated point
+            grad_outputs=torch.ones(n, 1, device=self._device),
+            # grad_outputs=ones because outputs is shape (n,1) — we want d(sum)/d(interp)
+            create_graph=True,   # Keep the computation graph so we can backprop through the GP
+            retain_graph=True,   # Don't free the graph after this call (critic loss needs it)
+        )[0]
+        # grads shape: (n, 50) — gradient of critic output w.r.t. each interpolated point
+```
+
+```python
+        return ((grads.norm(2, dim=1) - 1.0) ** 2).mean()
+        # grads.norm(2, dim=1): L2 norm of gradient for each sample → shape (n,)
+        # Subtract 1 because we want ||∇C|| = 1 (1-Lipschitz), not just ≤ 1
+        # Square and mean: the penalty is E[(||∇C(x̂)|| - 1)²]
+```
+
+### Training loop: `fit` (lines 252–332)
+
+```python
+    def fit(self, pc_scores: np.ndarray, conditions: np.ndarray):
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        # Setting both seeds ensures reproducibility — PyTorch and NumPy both
+        # draw random numbers during training (dropout, DataLoader shuffle, etc.)
+```
+
+```python
+        self._mean = pc_scores.mean(axis=0).astype(np.float32)
+        self._std  = (pc_scores.std(axis=0) + 1e-8).astype(np.float32)
+        normed = ((pc_scores - self._mean) / self._std).astype(np.float32)
+        # z-score normalisation: each PC dimension gets zero mean and unit variance.
+        # The 1e-8 prevents division-by-zero if a PC dimension has zero variance.
+        # Why normalise? PC1 might have values in [-60, +60] while PC50 is in [-0.5, 0.5].
+        # Without normalisation, PC1 dominates the loss and the network ignores PC50.
+```
+
+```python
+        X = torch.from_numpy(normed)           # (n_total, 50) — normalised PC scores
+        C = torch.from_numpy(conditions.astype(np.float32))  # (n_total, 3) — admixture conditions
+
+        bs     = min(self.batch_size, n_samples)   # Can't have batch > dataset size
+        loader = DataLoader(TensorDataset(X, C),
+                            batch_size=bs, shuffle=True,
+                            drop_last=(n_samples > bs))
+        # TensorDataset(X, C): pairs each PC score row with its condition row
+        # shuffle=True: randomise order each epoch to avoid training on correlated sequences
+        # drop_last: drop the final incomplete mini-batch (avoids size-1 batches that
+        #   break gradient statistics, but only when dataset is large enough to afford it)
+```
+
+```python
+        G     = _CondNetG(self.latent_dim, self.cond_dim, self.hidden_dims, n_dim).to(self._device)
+        C_net = _CondNetC(n_dim, self.cond_dim, self.hidden_dims).to(self._device)
+        # .to(self._device): move model parameters to GPU if available
+        opt_G = torch.optim.Adam(G.parameters(),     lr=self.lr, betas=(0.0, 0.9))
+        opt_C = torch.optim.Adam(C_net.parameters(), lr=self.lr, betas=(0.0, 0.9))
+        # Adam with betas=(0.0, 0.9) instead of the default (0.9, 0.999).
+        # β1=0.0 means: no first-moment (momentum) averaging.
+        # This is the WGAN-GP recommendation — momentum can cause oscillation in adversarial
+        # training because gradients switch sign as generator and critic compete.
+        # β2=0.9 keeps second-moment (adaptive learning rate) but with more forgetting.
+```
+
+```python
+        G.train(); C_net.train()    # Enable dropout/batchnorm training modes (not used here but good practice)
+        self._C = C_net             # Store reference so _gradient_penalty can call it
+        t_train = time.time()
+```
+
+### Main training loop
+
+```python
+        for epoch in range(1, self.n_epochs + 1):
+            g_sum = c_sum = 0.0          # Accumulate losses for the epoch-level log
+            for real_batch, cond_batch in loader:
+                real = real_batch.to(self._device)   # Move mini-batch to GPU
+                cond = cond_batch.to(self._device)
+                b    = real.size(0)                  # Actual batch size (may differ at end)
+```
+
+#### Critic update (runs n_critic=5 times per generator update)
+
+```python
+                for _ in range(self.n_critic):
+                    z    = torch.randn(b, self.latent_dim, device=self._device)
+                    # z: fresh noise sample for each critic update iteration
+                    fake = G(z, cond).detach()
+                    # G(z, cond): generator produces fake PC scores
+                    # .detach(): cuts the gradient tape — fake is treated as a constant
+                    # here. We're updating the critic, not the generator, so gradients
+                    # must NOT flow back into G.
+                    gp   = self._gradient_penalty(real, fake, cond)
+                    lC   = C_net(fake, cond).mean() - C_net(real, cond).mean() \
+                           + self.lambda_gp * gp
+                    # Critic loss = E[C(fake)] - E[C(real)] + λ·GP
+                    # The Wasserstein distance is: E[C(real)] - E[C(fake)]
+                    # We *minimise* the negative: E[C(fake)] - E[C(real)] + λ·GP
+                    # This pushes C(real) high and C(fake) low (discriminating real vs fake)
+                    opt_C.zero_grad()   # Clear gradients from last step
+                    lC.backward()       # Compute new gradients
+                    opt_C.step()        # Update critic parameters
+```
+
+**Why 5 critic updates per generator update?**  
+The Wasserstein distance is only meaningful when the critic is near-optimal.
+Training the critic more frequently ensures it's always a good Wasserstein
+estimator before the generator uses its gradients to improve.
+
+#### Generator update (once per batch)
+
+```python
+                z  = torch.randn(b, self.latent_dim, device=self._device)
+                lG = -C_net(G(z, cond), cond).mean()
+                # Generator loss = -E[C(G(z, c), c)]
+                # The generator wants to maximise the critic's score on its output
+                # (fool the critic into thinking fakes are real).
+                # Equivalently, minimise the negative.
+                opt_G.zero_grad()
+                lG.backward()   # Gradients flow through C_net into G — C_net is NOT detached
+                opt_G.step()
+                g_sum += lG.item(); c_sum += lC.item()
+```
+
+#### Logging
+
+```python
+            if self.log_every > 0 and epoch % self.log_every == 0:
+                nb = max(1, len(loader))   # Number of batches (avoid division by zero)
+                print(f"  [cWGAN epoch {epoch:>5}/{self.n_epochs}]  "
+                      f"G={g_sum/nb:+.4f}  C={c_sum/nb:+.4f}  [{_elapsed(t_train)}]")
+                # G loss is typically negative (critic gives fakes high scores → generator succeeds)
+                # C loss (after subtracting real) is negative when critic distinguishes well
+```
+
+```python
+        G.eval(); C_net.eval()    # Switch to eval mode — disables training-only behaviour
+        self._G = G               # Store trained generator for use in sample()
+```
+
+### Sampling: `sample` (lines 334–359)
+
+```python
+    def sample(self, n_samples: int, target_admixture: np.ndarray) -> np.ndarray:
+        cond = np.asarray(target_admixture, dtype=np.float32)
+        if cond.ndim == 1:
+            cond = np.tile(cond, (n_samples, 1))
+            # If a single [AFR, EUR, AMR] vector was given, repeat it n_samples times
+            # so every generated sample gets the same condition
+```
+
+```python
+        with torch.no_grad():   # Disable gradient tracking — we're inferring, not training
+            z    = torch.randn(n_samples, self.latent_dim, device=self._device)
+            c_t  = torch.from_numpy(cond).to(self._device)
+            norm = self._G(z, c_t).cpu().numpy()   # Shape: (n_samples, 50) — normalised PC scores
+        return (norm * self._std + self._mean).astype(np.float32)
+        # De-normalise: undo the z-score from fit()
+        # Result: PC scores in the original scale (e.g. PC1 in [-60, +60])
+```
+
+---
+
+## 11. PCA Compression: `PCACompressor`
+
+```python
+Lines 366–388
+```
+
+A thin wrapper around `sklearn.decomposition.PCA` that keeps the fitted object
+around for `transform` and `inverse_transform`.
+
+```python
+class PCACompressor:
+    def fit_transform(self, genotypes: np.ndarray) -> np.ndarray:
+        n_samples, n_snps = genotypes.shape
+        if self.n_components is None:
+            self.n_components = min(n_samples - 1, n_snps, 50)
+            # Can't have more PCs than samples-1 (mathematically impossible),
+            # more than SNPs (trivially), or more than our desired 50.
+```
+
+```python
+        self.pca = PCA(n_components=self.n_components,
+                       svd_solver='randomized', random_state=42)
+        # svd_solver='randomized': uses a randomised SVD algorithm (Halko et al. 2009).
+        # Much faster than exact SVD for large matrices (644 samples × 70k+ SNPs)
+        # with negligible accuracy loss for the top-k components.
+        # random_state=42: fixes the random seed inside the randomised SVD.
+        pc_scores = self.pca.fit_transform(genotypes)
+        # fit_transform simultaneously: finds the PC axes and projects the data.
+        # Result shape: (n_samples, n_components)
+```
+
+```python
+    def transform(self, genotypes: np.ndarray) -> np.ndarray:
+        return self.pca.transform(genotypes)
+        # Projects NEW data into the SAME PC space (fitted axes from fit_transform).
+        # Used to project BAQ data using the reference-fitted PCA.
+```
+
+```python
+    def inverse_transform(self, pc_scores: np.ndarray) -> np.ndarray:
+        return self.pca.inverse_transform(pc_scores)
+        # Maps PC scores BACK to SNP space.
+        # This is: genotypes ≈ mean + pc_scores @ components_
+        # It's lossy — you recover only the variance captured by the top 50 PCs.
+        # Result shape: (n_samples, n_snps)
+```
+
+**Why fit PCA on the reference, not on BAQ?**  
+The reference panel is larger (644 samples vs. 79–238) and spans all three
+ancestries in a balanced way. Fitting PCA on it ensures the PC axes capture
+*global* ancestry structure. If we fit on BAQ alone, the axes would reflect
+BAQ-specific variation and the reference centroids (used as admixture triangle
+corners) would be projections into a BAQ-centric coordinate system — less clean.
+
+---
+
+## 12. Genotype Discretization: `discretize_genotypes`
+
+```python
+Lines 391–410
+```
+
+One of the most carefully designed parts of the pipeline.
+
+**The problem with rounding:**  
+After inverse PCA, each SNP value is a continuous float (e.g. 0.87, 1.23, 1.94).
+The true values should be 0 (homozygous reference), 1 (heterozygous), or 2
+(homozygous alternate). Naive rounding (`np.rint`) would assign everything near
+1.0 to heterozygous. Because PCA reconstruction regresses values toward the
+population mean, many SNPs land near 1.0 — causing massive heterozygosity
+inflation (~37% more hets than in real data).
+
+**The Hardy-Weinberg insight:**  
+For a biallelic SNP with allele frequency p, Hardy-Weinberg equilibrium predicts:
+```
+P(0) = (1-p)²     P(1) = 2p(1-p)     P(2) = p²
+```
+For a diploid organism, the expected dosage E[dosage] = 2p. So if the continuous
+value v = 2p, then p = v/2.
+
+**Binomial sampling:**  
+```python
+def discretize_genotypes(continuous: np.ndarray, seed: int = 42) -> np.ndarray:
+    rng = np.random.default_rng(seed)   # NumPy's modern random number generator
+    p   = np.clip(continuous / 2.0, 0.0, 1.0)
+    # p = allele frequency per sample per SNP
+    # clip to [0, 1] because PCA reconstruction can produce values outside [0, 2]
+    return rng.binomial(2, p).astype(np.int8)
+    # binomial(n=2, p): simulate two independent Bernoulli draws (one per haploid chromosome)
+    # Result: 0 (both ref), 1 (one alt), 2 (both alt) — matching diploid genotype calls
+    # int8: 8-bit integers — the values are 0/1/2, so int8 saves 4× memory vs. int32
+```
+
+**Why this is correct:**  
+At v=1.0: p=0.5 → P(0)=25%, P(1)=50%, P(2)=25% — Hardy-Weinberg for a common variant.
+At v=0.2: p=0.1 → P(0)=81%, P(1)=18%, P(2)=1% — rare variant distribution.
+Rounding would give 100% P(0) for v<0.5 and 100% P(1) for 0.5≤v<1.5 — wrong.
+
+---
+
+## 13. Inference Admixture Sampling: `sample_target_admixture`
+
+```python
+Lines 417–436
+```
+
+```python
+def sample_target_admixture(n_samples, target_admixture,
+                             alpha_concentration=20.0, seed=42):
+    rng   = np.random.default_rng(seed)
+    alpha = target_admixture * alpha_concentration
+    # Dirichlet concentration parameters: α_i = target_i × concentration
+    # Example: target=[0.6, 0.2, 0.2], concentration=20 → α=[12, 4, 4]
+    alpha = np.maximum(alpha, 0.01)   # Prevent zero concentration parameters (undefined)
+    props = rng.dirichlet(alpha, size=n_samples).astype(np.float32)
+    return props   # (n_samples, 3) — each row sums to 1, centred on target_admixture
+```
+
+**The Dirichlet distribution** is the natural prior over probability vectors (simplex).
+With concentration α:
+- Large α (e.g. 20): samples tightly cluster near the mean — most samples get
+  admixture close to [0.6, 0.2, 0.2].
+- Small α (e.g. 2): samples spread across the triangle — some might be nearly
+  pure AFR, others nearly pure EUR, even though the mean is [0.6, 0.2, 0.2].
+
+This per-sample variation in conditioning vectors means each synthetic individual
+gets a slightly different ancestry profile — mimicking real population heterogeneity.
+
+---
+
+## 14. PCA Overlay Plot: `plot_pca_overlay`
+
+```python
+Lines 443–514
+```
+
+Generates the diagnostic PCA plot that overlays real, synthetic, and reference samples.
+
+```python
+def plot_pca_overlay(baq_pcs, synth_pcs, var_explained, save_path,
+                     ref_pcs=None, ref_pop_labels=None,
+                     triangle_vertices=None, baq_vertex_indices=None,
+                     target_admixture=None, job_id="", seed=42):
+    var_pct    = var_explained[:2] * 100   # Variance % for PC1 and PC2 (for axis labels)
+    ref_labels = np.array(ref_pop_labels) if ref_pop_labels is not None else None
+    fig, ax = plt.subplots(figsize=(7, 6))   # 7×6 inches figure
+```
+
+**Layer 1 — Reference pure samples (background):**
+```python
+    for sp in _SUPERPOPS:
+        mask = ref_labels == sp
+        if mask.any():
+            ax.scatter(ref_pcs[mask, 0], ref_pcs[mask, 1],
+                       c=_POP_COLORS[sp], alpha=0.40, s=22,
+                       label=sp, edgecolors='none', zorder=1)
+    # alpha=0.40: semi-transparent (reference is background context)
+    # s=22: small dot size
+    # zorder=1: drawn first, underneath everything else
+```
+
+**Layer 2 — Ancestry triangle:**
+```python
+    if triangle_vertices is not None:
+        pts = np.vstack([triangle_vertices[:, :2], triangle_vertices[0, :2]])
+        # Append first vertex at end to "close" the triangle polygon
+        ax.plot(pts[:, 0], pts[:, 1], color='#333333', linestyle='--', linewidth=1.2)
+        # Dashed line connecting the three centroids — the ancestry triangle
+        for i, sp in enumerate(_SUPERPOPS):
+            ax.scatter(triangle_vertices[i, 0], triangle_vertices[i, 1],
+                       marker='^', s=90, color=_POP_COLORS[sp],
+                       edgecolors='black', linewidths=0.7, zorder=6)
+            # Triangle markers (^) at each centroid, colour-matched to ancestry
+```
+
+**Layer 3 — Real BAQ/COR samples:**
+```python
+    ax.scatter(baq_pcs[:, 0], baq_pcs[:, 1],
+               c='#E63946',    # Red
+               alpha=0.9, s=50, label='Real (BAQ)',
+               edgecolors='white', linewidths=0.4, zorder=2)
+```
+
+**Layer 4 — BAQ extreme markers (star on the sample closest to each reference centroid):**
+```python
+    if baq_vertex_indices is not None:
+        for sp, idx in baq_vertex_indices.items():
+            ax.plot(baq_pcs[idx, 0], baq_pcs[idx, 1],
+                    marker='*', markersize=16, color='#E63946', ...)
+    # These stars highlight the "most AFR-like", "most EUR-like", and "most AMR-like"
+    # real samples — useful for visual anchoring.
+```
+
+**Layer 5 — Synthetic samples:**
+```python
+    ax.scatter(synth_pcs[:, 0], synth_pcs[:, 1],
+               c='#7B2FBE',    # Purple
+               alpha=0.7, s=50, label='Synthetic (cWGAN)', zorder=3)
+```
+
+```python
+    ax.set_xlabel(f"PC1 ({var_pct[0]:.1f}%)", fontsize=12)
+    ax.set_ylabel(f"PC2 ({var_pct[1]:.1f}%)", fontsize=12)
+    # Axis labels include the variance explained, e.g. "PC1 (18.3%)"
+```
+
+```python
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    # dpi=150: medium-high resolution
+    # bbox_inches='tight': prevent axis labels from being cropped
+    # plt.close(): free memory — important when generating many plots in a loop
+```
+
+---
+
+## 15. BAQ Vertex Finder: `_find_baq_vertices`
+
+```python
+Lines 521–534
+```
+
+```python
+def _find_baq_vertices(baq_pcs, ref_pcs, pop_labels):
+    labels = np.array(pop_labels)
+    vertex_pcs     = []
+    vertex_indices = {}
+    for sp in _SUPERPOPS:
+        mask     = labels == sp
+        centroid = ref_pcs[mask].mean(axis=0)     # Reference centroid for this ancestry
+        dists    = np.linalg.norm(baq_pcs - centroid, axis=1)
+        # Euclidean distance from each BAQ sample to this centroid (in 50D PC space)
+        idx      = int(np.argmin(dists))           # Index of the closest BAQ sample
+        vertex_pcs.append(baq_pcs[idx])
+        vertex_indices[sp] = idx
+    return np.array(vertex_pcs), vertex_indices
+    # Returns: the PC coordinates and dataset indices of the three "most extreme" BAQ samples
+```
+
+These are purely for the plot — the star markers on real BAQ samples that are
+closest to each ancestry corner. They help visually confirm that real samples
+span the full expected admixture range.
+
+---
+
+## 16. Main Pipeline: `run_pipeline`
+
+```python
+Lines 541–823
+```
+
+### Function signature and pre-flight
+
+```python
+def run_pipeline(baq_input_path, ref_input_path, fam_path,
+                 n_synthetic=200, output_path="synthetic_genotypes.csv",
+                 plot_path="pca_overlay.png", n_components=50, seed=42,
+                 target_admixture=None, alpha_concentration=20.0,
+                 variance_scale=0.0, wgan_epochs=3000,
+                 wgan_latent_dim=32, batch_size=64):
+```
+
+```python
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    # Global seeds — these ensure consistent behaviour for anything that uses
+    # numpy or torch random numbers outside of model training
+    t_total = time.time()    # Start the total wall-time clock
+```
+
+```python
+    job_id = os.environ.get('SLURM_JOB_ID', '')
+    if job_id:
+        def _tag(path):
+            base, ext = path.rsplit('.', 1)
+            return f"{base}_{job_id}.{ext}"
+        output_path = _tag(output_path)
+        plot_path   = _tag(plot_path)
+    # If running inside SLURM, the job ID is injected into output filenames.
+    # Example: pca_overlay_seed42.png → pca_overlay_seed42_9797825.png
+    # This prevents two concurrently running seeds from overwriting each other's files.
+```
+
+```python
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(plot_path)),   exist_ok=True)
+    # Create output directories if they don't exist.
+    # abspath resolves relative paths; dirname gets the directory component.
+    # exist_ok=True: don't error if the directory already exists.
+```
+
+---
+
+### Step 1 — Load BAQ Genotypes
+
+```python
+    baq_df    = pd.read_csv(baq_input_path, header=0)
+    # Read the unphased tensor CSV.
+    # header=0: first row is column names (SNP IDs like "rs12345")
+    # Result: DataFrame where rows = samples, columns = SNPs, values = 0/1/2 dosages
+    print(f"  BAQ: {baq_df.shape[0]} samples × {baq_df.shape[1]} SNPs")
+```
+
+---
+
+### Step 2 — Load Reference Genotypes + Labels
+
+```python
+    ref_df = pd.read_csv(ref_input_path, header=0)
+    pop_labels = load_population_labels(fam_path)
+    # Load reference genotypes and parse ancestry labels from the .fam file
+```
+
+```python
+    shared_snps = list(baq_df.columns.intersection(ref_df.columns))
+    if len(shared_snps) != len(baq_df.columns) or len(shared_snps) != len(ref_df.columns):
+        # The two datasets were QC-filtered independently — a small number of SNPs
+        # may have been dropped from one but not the other. Take only SNPs present in both.
+        baq_df = baq_df[shared_snps]
+        ref_df = ref_df[shared_snps]
+```
+
+```python
+    snp_names = list(baq_df.columns)   # Save SNP IDs for the output CSV header
+    baq_geno  = baq_df.values.astype(np.float32)   # Convert DataFrame to NumPy array
+    ref_geno  = ref_df.values.astype(np.float32)
+    del baq_df, ref_df   # Free the DataFrame memory — these are large and no longer needed
+```
+
+```python
+    if len(pop_labels) != ref_geno.shape[0]:
+        # .fam may have more entries than the filtered tensor (e.g. QC removed some samples).
+        # Truncate to match — assumes the ordering is preserved.
+        pop_labels = pop_labels[:ref_geno.shape[0]]
+```
+
+```python
+    counts = {sp: pop_labels.count(sp) for sp in _SUPERPOPS}
+    # Count how many samples of each ancestry are in the reference — printed for diagnostics
+```
+
+---
+
+### Step 3 — PCA Compression
+
+```python
+    compressor = PCACompressor(n_components=n_components)
+    ref_pcs    = compressor.fit_transform(ref_geno)   # Fit PCA on reference, get ref PC scores
+    baq_pcs    = compressor.transform(baq_geno)       # Project BAQ into the same PC space
+    # ref_pcs shape: (n_ref, 50)
+    # baq_pcs shape: (n_baq, 50)
+    # Both use the same 50 PC axes — essential for the triangle projection to make sense.
+```
+
+---
+
+### Step 4 — Admixture Conditions + PC1 Sign Fix
+
+```python
+    centroids = _ref_centroids(ref_pcs, pop_labels)
+    # centroids shape: (3, 50) — AFR/EUR/AMR mean positions in PC space
+```
+
+```python
+    # PC1 sign normalization — added to fix cross-dataset comparison
+    if centroids[0, 0] < centroids[1, 0]:
+        # centroids[0,0] = AFR PC1; centroids[1,0] = EUR PC1
+        # By convention: AFR should have higher (more positive) PC1 than EUR.
+        # If this isn't the case, the PC1 axis was flipped by PCA — correct it.
+        compressor.pca.components_[0] *= -1   # Flip the first principal component vector
+        ref_pcs[:, 0] *= -1                   # Flip PC1 for all reference samples
+        baq_pcs[:, 0] *= -1                   # Flip PC1 for all BAQ/COR samples
+        centroids[:, 0] *= -1                  # Flip PC1 for centroids
+        # Mathematically: -component[0] @ (-pc1_scores) = component[0] @ pc1_scores
+        # So inverse_transform is UNAFFECTED — the sign flip cancels out.
+```
+
+```python
+    baq_admix = estimate_baq_admixture(baq_pcs, centroids)
+    # baq_admix shape: (n_baq, 3) — estimated [AFR, EUR, AMR] proportions per sample
+    # These become the conditioning vectors c during WGAN training for BAQ rows.
+```
+
+```python
+    label_arr = np.array(pop_labels)
+    ref_admix = np.zeros((ref_geno.shape[0], 3), dtype=np.float32)
+    for i, sp in enumerate(_SUPERPOPS):
+        ref_admix[label_arr == sp, i] = 1.0
+    # One-hot encoding for reference samples:
+    # AFR samples → [1, 0, 0]
+    # EUR samples → [0, 1, 0]
+    # AMR samples → [0, 0, 1]
+    # This is the "ground truth" condition — reference samples ARE their ancestry.
+```
+
+```python
+    other_mask = (ref_admix.sum(axis=1) == 0)
+    ref_admix[other_mask] = 1.0 / 3.0
+    # Samples labeled 'OTHER' get equal weight [1/3, 1/3, 1/3].
+    # They won't meaningfully skew training because they're a small minority.
+```
+
+```python
+    all_pcs   = np.vstack([baq_pcs,   ref_pcs]).astype(np.float32)
+    all_admix = np.vstack([baq_admix, ref_admix]).astype(np.float32)
+    # Stack BAQ and reference into one combined training set.
+    # all_pcs shape:   (n_baq + n_ref, 50)
+    # all_admix shape: (n_baq + n_ref, 3)
+    # The WGAN trains on this joint dataset — it sees both admixed and pure-ancestry examples.
+```
+
+---
+
+### Step 5 — Train Conditional WGAN-GP
+
+```python
+    model = ConditionalWGAN(
+        latent_dim  = wgan_latent_dim,   # 32
+        n_epochs    = wgan_epochs,       # 3000
+        batch_size  = batch_size,        # 64
+        seed        = seed,
+    )
+    model.fit(all_pcs, all_admix)
+    # All the training happens inside .fit() — see Section 10 above.
+```
+
+---
+
+### Step 6 — Inference / Sampling
+
+This section decides the conditioning vectors used at inference time (which
+ancestry profile to target for the synthetic samples).
+
+**Mode 1: `variance_scale > 0`** — spread conditions across the ancestry simplex:
+```python
+    if variance_scale > 0.0:
+        if variance_scale <= 1.0:
+            # Fit a Dirichlet to the observed BAQ admixture distribution.
+            mean_baq   = baq_admix.mean(axis=0)     # Mean [AFR, EUR, AMR] across BAQ
+            var_baq    = baq_admix.var(axis=0)      # Variance of each proportion
+            alpha0_per = mean_baq * (1 - mean_baq) / np.maximum(var_baq, 1e-10) - 1.0
+            # Method of moments: estimate the Dirichlet concentration parameter α0
+            # from observed mean μ and variance σ²:
+            # For Dirichlet: Var(X_i) = μ_i(1-μ_i)/(α0+1)
+            # → α0 = μ(1-μ)/σ² - 1
+            alpha0     = max(float(np.nanmedian(alpha0_per)), 0.1)
+            # Take the median across the three components (more robust than mean)
+            # and ensure it's at least 0.1 to avoid degenerate Dirichlet.
+            alpha_fit  = mean_baq * alpha0   # Full concentration vector
+            baq_cond   = rng.dirichlet(np.maximum(alpha_fit, 0.01), size=n_synthetic)
+            uniform    = rng.dirichlet([1.0, 1.0, 1.0], size=n_synthetic)
+            # uniform: Dirichlet(1,1,1) = uniform distribution over the simplex
+            t          = float(variance_scale)
+            cond_infer = ((1.0 - t) * baq_cond + t * uniform)
+            # Linear blend between BAQ-fitted and uniform:
+            # vs=0: pure BAQ cluster; vs=1: fully uniform across triangle
+```
+
+```python
+        else:
+            # vs > 1: blend uniform with corner-heavy Dirichlet
+            sub        = max(1.0 - (variance_scale - 1.0) * 0.5, 0.05)
+            # Dirichlet([sub,sub,sub]) with sub<1 is "super-Dirichlet" — mass pushed TOWARD vertices
+            # At vs=1.5: sub = max(1-0.25, 0.05) = 0.75 (mildly corner-heavy)
+            t          = float(variance_scale - 1.0)
+            uniform    = rng.dirichlet([1.0, 1.0, 1.0], size=n_synthetic)
+            corners    = rng.dirichlet([sub, sub, sub],  size=n_synthetic)
+            cond_infer = ((1.0 - t) * uniform + t * corners)
+            # vs=1.5 → t=0.5 → 50% uniform + 50% corner-heavy = wide but vertex-emphasising spread
+```
+
+**Mode 2: `target_admixture is None`** — conservative BAQ-fitted Dirichlet:
+```python
+    elif target_admixture is None:
+        mean_baq   = baq_admix.mean(axis=0)
+        # ... same method-of-moments fitting as above ...
+        cond_infer = rng.dirichlet(np.maximum(alpha_fit, 0.01), size=n_synthetic)
+        # Samples will cluster near the observed mean BAQ admixture.
+        # Good for validation: does the generator reproduce the real BAQ distribution?
+```
+
+**Mode 3: `target_admixture` specified** — explicit target:
+```python
+    else:
+        target_admixture = np.array(target_admixture, dtype=np.float32)
+        target_admixture /= target_admixture.sum()   # Normalise to ensure sum=1
+        cond_infer = sample_target_admixture(
+            n_synthetic, target_admixture,
+            alpha_concentration=alpha_concentration, seed=seed)
+        # Dirichlet centred on the specified target with the given concentration
+```
+
+```python
+    synth_pcs = model.sample(n_synthetic, cond_infer)
+    # cond_infer shape: (n_synthetic, 3) — one admixture vector per synthetic sample
+    # synth_pcs shape:  (n_synthetic, 50) — generated PC scores in original scale
+```
+
+---
+
+### Step 7 — Inverse PCA, Discretize, Save
+
+```python
+    synth_geno = discretize_genotypes(compressor.inverse_transform(synth_pcs), seed=seed)
+    # compressor.inverse_transform(synth_pcs):
+    #   Maps (n_synthetic, 50) PC scores → (n_synthetic, n_snps) continuous floats
+    # discretize_genotypes(...):
+    #   Maps continuous floats → 0/1/2 integer dosages via Binomial(2, v/2) sampling
+    # synth_geno shape: (n_synthetic, n_snps) — integer dtype int8
+```
+
+```python
+    n_fixed = int(np.sum(np.var(synth_geno, axis=0) == 0))
+    # Count SNPs that are invariant (same value in all synthetic samples).
+    # Some SNPs will be fixed — low-frequency variants whose PCA reconstruction
+    # always yields a dosage so close to 0 that all binomial draws land on 0.
+    # This is expected and reported as a QC diagnostic.
+```
+
+```python
+    pd.DataFrame(synth_geno, columns=snp_names).to_csv(output_path, index=False)
+    # Wrap in DataFrame with the original SNP column names and save as CSV.
+    # index=False: don't write the row index (0, 1, 2...) as a column.
+```
+
+```python
+    synth_pcs_plot = compressor.transform(synth_geno.astype(np.float32))
+    # Re-project the DISCRETIZED synthetic genotypes back into PC space.
+    # This is important: synth_pcs (from the generator) and synth_pcs_plot (after
+    # inverse PCA + discretization + re-projection) will be slightly different.
+    # Plotting the re-projected version shows where the *final output* lands in PC space,
+    # not just where the generator sampled — a more honest quality check.
+```
+
+```python
+    _, baq_vertex_indices = _find_baq_vertices(baq_pcs, ref_pcs, pop_labels)
+    plot_pca_overlay(
+        baq_pcs=baq_pcs[:, :2],           # Only PC1 and PC2 for the 2D plot
+        synth_pcs=synth_pcs_plot[:, :2],
+        var_explained=compressor.pca.explained_variance_ratio_,
+        save_path=plot_path,
+        ref_pcs=ref_pcs[:, :2],
+        ref_pop_labels=pop_labels,
+        triangle_vertices=centroids[:, :2],
+        baq_vertex_indices=baq_vertex_indices,
+        target_admixture=target_admixture,
+        job_id=job_id,
+        seed=seed,
+    )
+    print(f"\n  Total wall time: {_elapsed(t_total)}")
+    return synth_geno   # Return the genotype array (useful if called from another script)
+```
+
+---
+
+## 17. CLI (`__main__` block)
+
+```python
+Lines 830–888
+```
+
+```python
+if __name__ == "__main__":
+    # Only executes when the script is run directly (not imported as a module)
+    parser = argparse.ArgumentParser(...)
+```
+
+Each `add_argument` call defines one CLI flag:
+
+| Flag | Type | Default | Meaning |
+|---|---|---|---|
+| `--baq_input` | str | required | Query population genotype CSV |
+| `--ref_input` | str | required | Reference panel genotype CSV |
+| `--fam` | str | required | PLINK .fam with ancestry labels |
+| `--n_synthetic` | int | 200 | Number of synthetic samples to generate |
+| `--output` | str | `synthetic_genotypes.csv` | Output genotype file |
+| `--plot` | str | `pca_overlay.png` | Output PCA plot |
+| `--n_components` | int | 50 | Number of PCs for PCA |
+| `--seed` | int | 42 | Random seed for reproducibility |
+| `--target_admixture` | str | None | Comma-separated [AFR,EUR,AMR] e.g. `0.6,0.2,0.2` |
+| `--alpha_concentration` | float | 20.0 | Dirichlet precision around target |
+| `--variance_scale` | float | 0.0 | Simplex spread (0=tight, 1.5=wide) |
+| `--wgan_epochs` | int | 3000 | Training epochs |
+| `--wgan_latent_dim` | int | 32 | Generator noise dimension |
+| `--batch_size` | int | 64 | Mini-batch size |
+
+```python
+    target = None
+    if args.target_admixture is not None:
+        parts  = [float(x) for x in args.target_admixture.split(',')]
+        # Split "0.6,0.2,0.2" → ["0.6", "0.2", "0.2"] → [0.6, 0.2, 0.2]
+        target = np.array(parts, dtype=np.float32)
+        if len(target) != 3:
+            raise ValueError("--target_admixture must have exactly 3 values")
+        # Hard validation — the entire model assumes exactly 3 ancestry groups.
+```
+
+```python
+    run_pipeline(
+        baq_input_path      = args.baq_input,
+        # ... all parsed args forwarded to run_pipeline() ...
+    )
+```
+
+---
+
+## Full Data Flow Summary
+
+```
+DISK
+ ├── BAQ CSV (79×70811)         → baq_geno (79×70811 float32)
+ ├── Reference CSV (644×70811)  → ref_geno (644×70811 float32)
+ └── .fam                       → pop_labels (644 strings)
+
+PCA (fit on ref)
+ ref_geno → ref_pcs (644×50)
+ baq_geno → baq_pcs (79×50)  [projected into ref coordinate system]
+
+Centroids & sign fix
+ ref_pcs + pop_labels → centroids (3×50)  [AFR/EUR/AMR poles]
+ [PC1 sign normalised if AFR_PC1 < EUR_PC1]
+
+Admixture estimation
+ baq_pcs + centroids → baq_admix (79×3)   [barycentric projection]
+ pop_labels → ref_admix (644×3)           [one-hot]
+
+Combined training set
+ all_pcs   (723×50)  = vstack(baq_pcs, ref_pcs)
+ all_admix (723×3)   = vstack(baq_admix, ref_admix)
+
+cWGAN-GP Training
+ (all_pcs, all_admix) → trained Generator G: ℝ³² × Δ² → ℝ⁵⁰
+
+Inference
+ cond_infer (200×3)  [Dirichlet-sampled or explicit target]
+ z (200×32)          [N(0,I) noise]
+ G(z, cond_infer)    → synth_pcs (200×50)
+
+Reconstruction
+ synth_pcs → inverse_PCA → continuous (200×70811)
+           → Binomial(2,v/2) → synth_geno (200×70811 int8)
+
+OUTPUT
+ ├── synthetic_genotypes_seed42.csv  (200×70811)
+ └── pca_overlay_seed42.png
+```
+
+---
+
+## Key Architectural Decisions — Thesis Summary Table
+
+| Decision | What was done | Why |
+|---|---|---|
+| PC space (not raw SNPs) | PCA compresses 70k SNPs → 50 PCs | Memory, training stability, denoising |
+| Fit PCA on reference, not BAQ | Reference is larger, ancestrally balanced | Axes capture global structure, not BAQ-specific variation |
+| Conditional GAN (not unconditional) | 3-dim admixture vector c fed to G and C | Control synthetic ancestry; no post-hoc manipulation |
+| WGAN-GP (not vanilla GAN) | Wasserstein distance + gradient penalty | Training stability; no mode collapse; no log(0) |
+| n_critic=5 | Critic updated 5× per generator update | Critic must be near-optimal for meaningful gradient signal |
+| LayerNorm in generator | Normalise within sample, not across batch | Compatible with gradient penalty; stable for small batches |
+| No BatchNorm in critic | Per-sample gradients needed for GP | BatchNorm couples samples and distorts GP gradient |
+| Adam betas=(0.0, 0.9) | No momentum in WGAN-GP | Momentum causes oscillation in adversarial training |
+| Binomial discretization | Binomial(2, v/2) instead of rounding | Preserves expected dosage, avoids heterozygosity inflation |
+| Barycentric projection | Least-squares OLS onto 3-vertex simplex | Model-free admixture estimation; no reference panel assumption |
+| PC1 sign normalization | Flip if AFR_PC1 < EUR_PC1 | PCA sign is arbitrary; ensures cross-dataset visual comparability |
+| Dirichlet inference | Sample per-sample conditions from Dirichlet | Mimics real heterogeneity within target ancestry group |

@@ -1,2 +1,18 @@
-# Data
+# Input data — never commit (raw VCFs, PLINK binaries, tensors, SNP lists)
 data/
+snps/
+
+# Slurm job logs
+slurm/
+
+# Generated synthetic genotypes — large, reproducible from src/conditional_wgan_pipeline.py
+results/*/*gen-data*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environments
+ggd_env/
+*.egg-info/
