@@ -1,1 +1,1 @@
-src/conditional_wgan_pipeline_extended.py outputs run results here
+src/conditional_wgan_pipeline_extended.py outputs run results here. Results of Ninh's sample size sweep experiment can be found here: https://gtvault-my.sharepoint.com/:u:/r/personal/nba9_gatech_edu/Documents/20261004_105931_sample_size_sweep.tar.gz?d=wc3087a8abfa24505884370f146f86ea1&csf=1&web=1&e=z1p83B
