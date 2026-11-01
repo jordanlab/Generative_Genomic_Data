@@ -1,0 +1,16 @@
+# Complete CPU-ready Conda environment.
+# For NVIDIA GPU installations, use environment-base.yml + requirements.txt
+# and then one of the CUDA-specific PyTorch requirement files instead.
+name: cwgan-genotype
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip>=25
+  - numpy=2.3.5
+  - pandas=2.2.3
+  - scikit-learn=1.8.0
+  - matplotlib=3.10.8
+  - pip:
+      - --index-url https://download.pytorch.org/whl/cpu
+      - torch==2.10.0

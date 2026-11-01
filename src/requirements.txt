@@ -1,0 +1,6 @@
+# Runtime scientific Python dependencies for conditional_wgan_pipeline.py
+# Versions pinned to the environment used to exercise the latest pipeline.
+numpy==2.3.5
+pandas==2.2.3
+scikit-learn==1.8.0
+matplotlib==3.10.8
