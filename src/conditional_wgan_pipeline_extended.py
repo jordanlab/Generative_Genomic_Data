@@ -85,6 +85,9 @@ import matplotlib.pyplot as plt
 from plot_colors import SYNTHETIC_COLOR, get_real_color
 from cwgan_extensions.conditioning import load_external_conditions
 from cwgan_extensions.models import FiLMConditionalWGAN, GenotypeConvWGAN
+from genotype_sampling import METHODS as SAMPLING_METHODS, sample_dosages, inspect_raw, plot_pca_sampling_diagnostics
+from genotype_paper_evaluation import evaluate_paper_analyses
+from genotype_input_qc import audit as audit_genotypes, enforce as enforce_genotype_qc, write_bundle as write_genotype_qc
 
 
 def _elapsed(t0: float) -> str:
@@ -157,6 +160,8 @@ def _ref_centroids(ref_pcs: np.ndarray, pop_labels: list) -> np.ndarray:
     for sp in _SUPERPOPS:
         mask     = labels == sp
         # Average PC position of all samples from this ancestry group
+        if not mask.any():
+            raise ValueError(f'Reference .fam has no {sp} subjects. Confirm IID population-code format (e.g. forReferenceYRI_...) and row alignment.')
         centroid = ref_pcs[mask].mean(axis=0)
         vertices.append(centroid)
         print(f"  {sp} centroid ({mask.sum():>3d} samples): "
@@ -782,6 +787,8 @@ def _find_baq_vertices(baq_pcs: np.ndarray,
     vertex_indices = {}
     for sp in _SUPERPOPS:
         mask     = labels == sp
+        if not mask.any():
+            raise ValueError(f'Reference .fam has no {sp} subjects. Confirm IID population-code format (e.g. forReferenceYRI_...) and row alignment.')
         centroid = ref_pcs[mask].mean(axis=0)
         dists    = np.linalg.norm(baq_pcs - centroid, axis=1)
         idx      = int(np.argmin(dists))
@@ -895,6 +902,8 @@ def plot_validation_selection_history(records: list, save_path: str, checkpoint_
         if in_sample_only else
         'Validation synthetic-data fidelity used for checkpoint selection'
     )
+    if 'checkpoint_sampling_method' in df:
+        title += f" | sampler={df.iloc[0]['checkpoint_sampling_method']}"
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
     axes[0].plot(df['epoch'], df['selection_score'], marker='o', markersize=3,
@@ -957,7 +966,9 @@ def _make_validation_checkpoint_callback(model_backend: str,
                                          max_samples: int,
                                          max_ld_pairs: int,
                                          selection_metric: str,
-                                         records: list):
+                                         records: list,
+                                         sampling_method: str = 'binomial',
+                                         sampling_temperature: float = 0.35):
     """Build an epoch callback that scores generated data against real samples.
 
     If a validation split exists, the real comparison cohort is the held-out
@@ -1027,12 +1038,14 @@ def _make_validation_checkpoint_callback(model_backend: str,
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(eval_seed)
             if model_backend == 'genotype_conv':
-                synth_geno = model.sample_genotypes(n_eval, cond, seed=eval_seed)
+                raw_selection_dosages = model.sample_dosage(n_eval, cond)
             else:
                 synth_pc_cont = model.sample(n_eval, cond)
-                synth_geno = discretize_genotypes(
-                    compressor.inverse_transform(synth_pc_cont), seed=eval_seed
-                )
+                raw_selection_dosages = compressor.inverse_transform(synth_pc_cont)
+            synth_geno = sample_dosages(
+                raw_selection_dosages, sampling_method, seed=eval_seed,
+                temperature=sampling_temperature,
+            )
             real_pcs = compressor.transform(real_geno.astype(np.float32))
             synth_pcs = compressor.transform(synth_geno.astype(np.float32))
             metrics, _ = compute_quality_metrics(
@@ -1059,12 +1072,14 @@ def _make_validation_checkpoint_callback(model_backend: str,
             'n_validation_samples': int(n_eval) if evaluation_basis == 'held_out_validation' else 0,
             'n_training_comparison_samples': int(n_eval) if evaluation_basis == 'training_in_sample' else 0,
             'selection_metric': selection_metric,
+            'checkpoint_sampling_method': sampling_method,
+            'sampling_temperature': float(sampling_temperature),
             'selection_score': float(score),
             **comps,
         }
         records.append(record)
         print(
-            f"  [checkpoint selection epoch {epoch}] score={score:.6g} "
+            f"  [checkpoint selection epoch {epoch}] sampler={sampling_method} score={score:.6g} "
             f"MAF={comps['maf_mae']:.4g} HET={comps['heterozygosity_abs_diff']:.4g} "
             f"LD={comps['ld_r2_mae']:.4g} MMD2={comps['pc_mmd2']:.4g} "
             f"NNAAdev={comps['nnaa_abs_deviation']:.4g} n={n_eval} "
@@ -1283,6 +1298,12 @@ def run_pipeline(data_input_paths: list,
                  device: str = 'auto',
                  log_every: int = 500,
                  metric_max_ld_pairs: int = 2000,
+                 evaluate: bool = True,
+                 sampling_methods: list = None,
+                 sampling_temperature: float = 0.35,
+                 paper_max_distance_samples: int = 256,
+                 paper_max_motif_windows: int = 256,
+                 paper_max_triplets: int = 2000,
                  model_backend: str = 'baseline_pca',
                  condition_source: str = 'pca_barycentric',
                  condition_input_paths: dict = None,
@@ -1292,13 +1313,16 @@ def run_pipeline(data_input_paths: list,
                  conv_channels: int = 128,
                  conv_blocks: int = 4,
                  checkpoint_metric: str = 'composite',
+                 checkpoint_sampling_method: str = None,
                  checkpoint_eval_every: int = 50,
                  checkpoint_metric_max_samples: int = 128,
                  checkpoint_metric_max_ld_pairs: int = 500,
                  save_models: list = None,
                  subset_samples: dict = None,
                  sample_name: str = "BAQ",
-                 real_color: str = None):
+                 real_color: str = None,
+                 max_missing_fraction: float = None,
+                 fail_on_absent_zero: bool = False):
     """Run one model, with one query dataset or a pre-harmonized combination."""
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -1328,6 +1352,16 @@ def run_pipeline(data_input_paths: list,
     selected_models_root = os.path.join(model_dir, 'saved_model_outputs')
     os.makedirs(selected_models_root, exist_ok=True)
     save_models = list(dict.fromkeys(save_models or ['best']))
+    sampling_methods = list(dict.fromkeys(sampling_methods or ['binomial']))
+    checkpoint_sampling_method = checkpoint_sampling_method or sampling_methods[0]
+    if checkpoint_sampling_method not in SAMPLING_METHODS:
+        raise ValueError(f'Unsupported checkpoint sampler: {checkpoint_sampling_method}')
+    if checkpoint_sampling_method not in sampling_methods:
+        # Also save an output/plot for the method used to select best, so its
+        # effects remain inspectable alongside the other requested samplers.
+        sampling_methods.append(checkpoint_sampling_method)
+    print(f'  Genotype samplers: {sampling_methods}; checkpoint selection uses '
+          f'{checkpoint_sampling_method} (temperature={sampling_temperature})', flush=True)
 
     job_id = os.environ.get('SLURM_JOB_ID', '')
     print("\n" + "=" * 88, flush=True)
@@ -1340,6 +1374,9 @@ def run_pipeline(data_input_paths: list,
     t0 = time.time()
     print("\n[1/9] Loading query genotype dataset(s)...", flush=True)
     query_dfs = []
+    input_qc_stages = []
+    input_qc_per_snp = {}
+    qc_source_paths = {}
     # This run receives exactly one resolved subset choice per dataset.  ``None``
     # means use all rows.  Sample-size sweeps are expanded into independent runs
     # by main() before run_pipeline() is called.
@@ -1356,6 +1393,11 @@ def run_pipeline(data_input_paths: list,
     subset_record = {}
     for name, input_path in zip(dataset_members, data_input_paths):
         df = pd.read_csv(input_path, header=0)
+        qc_source_paths[name]=input_path
+        raw_qc=audit_genotypes(df.to_numpy(dtype=np.float32),dataset=name,stage='raw_full_query',
+                                path=input_path,missing_rule='negative')
+        enforce_genotype_qc(raw_qc,max_missing_fraction,fail_on_absent_zero)
+        input_qc_stages.append(raw_qc)
         original_n = int(df.shape[0])
         query_original_sizes[name] = original_n
         requested_n = subset_samples.get(name)
@@ -1392,6 +1434,9 @@ def run_pipeline(data_input_paths: list,
             'nested_permutation_prefix_length': int(len(selected)) if requested_n is not None else None,
             'selected_row_indices_zero_based': selected.astype(int).tolist(),
         }
+        input_qc_stages.append(audit_genotypes(df.to_numpy(dtype=np.float32),
+                 dataset=name,stage='selected_query_before_snp_intersection',path=input_path,
+                 missing_rule='negative'))
         query_dfs.append((name, df))
         print(f"  {name}: using {df.shape[0]} samples x {df.shape[1]} SNPs", flush=True)
 
@@ -1412,6 +1457,10 @@ def run_pipeline(data_input_paths: list,
     ref_dfs = []
     for name, ref_path in zip(dataset_members, ref_input_paths):
         ref_df_member = pd.read_csv(ref_path, header=0)
+        ref_qc=audit_genotypes(ref_df_member.to_numpy(dtype=np.float32),dataset=name,
+                  stage='raw_full_reference',path=ref_path,missing_rule='negative')
+        enforce_genotype_qc(ref_qc,max_missing_fraction,fail_on_absent_zero)
+        input_qc_stages.append(ref_qc)
         ref_dfs.append((name, ref_path, ref_df_member))
         print(
             f"  {name} reference: {ref_df_member.shape[0]} samples x "
@@ -1467,6 +1516,16 @@ def run_pipeline(data_input_paths: list,
                 )
         print("  Combined-model reference check passed: all member references match on shared SNPs.", flush=True)
 
+    input_qc_stages.append(audit_genotypes(query_geno,dataset=sample_name,
+               stage='aligned_query_pre_imputation',missing_rule='negative'))
+    input_qc_stages.append(audit_genotypes(ref_geno,dataset='reference',
+               stage='aligned_reference_pre_imputation',missing_rule='negative'))
+    input_qc_per_snp={'aligned_query_before_imputation':(query_geno.copy(),snp_names),
+                      'aligned_reference_before_imputation':(ref_geno.copy(),snp_names)}
+    # The current cWGAN imputer uses (x<0) only; this is intentionally left
+    # unchanged for backwards comparability. The QC reports NaN separately.
+    query_miss_columns=np.count_nonzero(query_geno>=0,axis=0)==0
+    ref_miss_columns=np.count_nonzero(ref_geno>=0,axis=0)==0
     del ref_dfs, aligned_refs, query_dfs, query_mats
 
     def _impute_missing(mat, label):
@@ -1486,6 +1545,26 @@ def run_pipeline(data_input_paths: list,
 
     query_geno = _impute_missing(query_geno, sample_name)
     ref_geno = _impute_missing(ref_geno, 'reference')
+    input_qc_stages.append(audit_genotypes(query_geno,dataset=sample_name,
+               stage='aligned_query_after_mean_imputation',missing_rule='negative'))
+    input_qc_stages.append(audit_genotypes(ref_geno,dataset='reference',
+               stage='aligned_reference_after_mean_imputation',missing_rule='negative'))
+    write_genotype_qc(os.path.join(model_dir,'input_qc'),input_qc_stages,
+        per_snp=input_qc_per_snp,
+        imputations={'query':(input_qc_per_snp['aligned_query_before_imputation'][0],query_geno,snp_names),
+                     'reference':(input_qc_per_snp['aligned_reference_before_imputation'][0],ref_geno,snp_names)},
+        metadata={'pipeline':'conditional_wgan_pipeline_extended.py',
+                  'imputation':'negative-valued calls replaced by per-SNP mean of nonnegative calls',
+                  'mean_fill_zero_when_all_missing':True,
+                  'query_all_missing_snp_columns':int(query_miss_columns.sum()),
+                  'reference_all_missing_snp_columns':int(ref_miss_columns.sum()),
+                  'query_subset_selection_before_imputation':True,
+                  'snp_intersection_before_imputation':True,
+                  'snp_order':'first reference CSV column order (not re-sorted)',
+                  'reference_and_query_imputed_separately':True,
+                  'missing_nan_not_imputed_in_legacy_cwgan':True,
+                  'max_missing_fraction':max_missing_fraction,
+                  'fail_on_absent_zero':fail_on_absent_zero})
 
     if len(pop_labels) != ref_geno.shape[0]:
         print(f"  WARNING: fam has {len(pop_labels)} entries but reference tensor has "
@@ -1533,6 +1612,18 @@ def run_pipeline(data_input_paths: list,
         query_pcs[:, 0] *= -1
         centroids[:, 0] *= -1
         print("  [INFO] Flipped PC1 sign for consistent orientation (AFR->positive PC1)", flush=True)
+    # Save the PCA *after* the orientation convention is applied.  Older runs
+    # wrote the NPZ before sign flipping, which makes their saved weights and
+    # saved PCA components potentially inconsistent at retrospective resampling.
+    np.savez_compressed(
+        pca_checkpoint_path, components=compressor.pca.components_,
+        mean=compressor.pca.mean_,
+        explained_variance=compressor.pca.explained_variance_,
+        explained_variance_ratio=compressor.pca.explained_variance_ratio_,
+        singular_values=compressor.pca.singular_values_,
+        snp_names=np.asarray(snp_names, dtype=str),
+        pc_sign_applied_to_saved_model=np.array(True),
+    )
 
     if condition_source == 'pca_barycentric':
         query_admix = estimate_baq_admixture(query_pcs, centroids)
@@ -1610,10 +1701,12 @@ def run_pipeline(data_input_paths: list,
         max_samples=checkpoint_metric_max_samples,
         max_ld_pairs=checkpoint_metric_max_ld_pairs,
         selection_metric=checkpoint_metric, records=validation_selection_records,
+        sampling_method=checkpoint_sampling_method,
+        sampling_temperature=sampling_temperature,
     )
     if val_fraction == 0:
         print(
-            f"  Checkpoint selection: metric={checkpoint_metric}, every={checkpoint_eval_every} epoch(s), "
+            f"  Checkpoint selection: metric={checkpoint_metric}, sampler={checkpoint_sampling_method}, every={checkpoint_eval_every} epoch(s), "
             f"using IN-SAMPLE query training data because val_fraction=0; "
             f"max_comparison_samples={checkpoint_metric_max_samples}.", flush=True
         )
@@ -1623,7 +1716,7 @@ def run_pipeline(data_input_paths: list,
         )
     else:
         print(
-            f"  Checkpoint selection: metric={checkpoint_metric}, every={checkpoint_eval_every} epoch(s), "
+            f"  Checkpoint selection: metric={checkpoint_metric}, sampler={checkpoint_sampling_method}, every={checkpoint_eval_every} epoch(s), "
             f"using held-out validation data; max_comparison_samples={checkpoint_metric_max_samples}", flush=True
         )
 
@@ -1748,6 +1841,8 @@ def run_pipeline(data_input_paths: list,
         evaluation_bases = sorted({str(r.get('evaluation_basis', 'unknown')) for r in validation_selection_records})
         selection_summary = {
             'selection_metric': checkpoint_metric,
+            'checkpoint_sampling_method': checkpoint_sampling_method,
+            'sampling_temperature': float(sampling_temperature),
             'lower_is_better': True,
             'evaluation_basis': evaluation_bases[0] if len(evaluation_bases) == 1 else evaluation_bases,
             'in_sample_warning': (
@@ -1858,11 +1953,15 @@ def run_pipeline(data_input_paths: list,
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(eval_seed)
         if model_backend == 'genotype_conv':
-            synth_geno = model.sample_genotypes(n_synthetic, cond_infer, seed=eval_seed)
-            synth_pcs = compressor.transform(synth_geno.astype(np.float32))
+            raw_dosages = model.sample_dosage(n_synthetic, cond_infer)
+            synth_pcs = compressor.transform(raw_dosages.astype(np.float32))
         else:
             synth_pcs = model.sample(n_synthetic, cond_infer)
-            synth_geno = discretize_genotypes(compressor.inverse_transform(synth_pcs), seed=eval_seed)
+            raw_dosages = compressor.inverse_transform(synth_pcs)
+        inspect_raw(raw_dosages, os.path.join(variant_dir, 'sampling_diagnostics'), eval_seed, snp_names=snp_names)
+        method_samples = {method: sample_dosages(raw_dosages, method, eval_seed,
+                           sampling_temperature) for method in sampling_methods}
+        synth_geno = method_samples[sampling_methods[0]]
         pd.DataFrame(cond_infer, columns=_SUPERPOPS).to_csv(variant_cond_path, index=False)
         print(f"  [7/9] Sampling complete [{_elapsed(t_variant)}]", flush=True)
 
@@ -1871,11 +1970,40 @@ def run_pipeline(data_input_paths: list,
         print(f"  Fixed SNPs: {n_fixed}/{query_geno.shape[1]} ({100*n_fixed/query_geno.shape[1]:.1f}%)", flush=True)
         pd.DataFrame(synth_geno, columns=snp_names).to_csv(variant_output_path, index=False)
         print(f"  Saved genotypes: {variant_output_path}", flush=True)
+        for method, method_geno in method_samples.items():
+            method_path = os.path.join(variant_outputs_dir, f'synthetic_genotypes_{method}.csv')
+            pd.DataFrame(method_geno, columns=snp_names).to_csv(method_path, index=False)
+
+        # Matched, per-method PCA diagnostics.  The legacy pca_overlay.png
+        # remains unchanged for compatibility; method-specific overlays always
+        # use the discrete genotype CSV being evaluated, including genotype_conv.
+        sampled_method_pcs = {
+            method: compressor.transform(geno.astype(np.float32))
+            for method, geno in method_samples.items()
+        }
+        plot_pca_sampling_diagnostics(
+            query_pcs, synth_pcs, sampled_method_pcs, variant_plots_dir,
+            explained_variance=compressor.pca.explained_variance_ratio_,
+        )
+        for method, pcs in sampled_method_pcs.items():
+            _, query_vertex_indices = _find_baq_vertices(query_pcs, ref_pcs, pop_labels)
+            plot_pca_overlay(
+                baq_pcs=query_pcs[:, :2], synth_pcs=pcs[:, :2],
+                var_explained=compressor.pca.explained_variance_ratio_,
+                save_path=os.path.join(variant_plots_dir, f'pca_overlay_{method}_reference.png'),
+                ref_pcs=ref_pcs[:, :2], ref_pop_labels=pop_labels,
+                triangle_vertices=centroids[:, :2],
+                baq_vertex_indices=query_vertex_indices,
+                target_admixture=target_admixture,
+                job_id=job_id, seed=seed, sample_name=f'{sample_name} [{method}]',
+                real_color=real_color,
+            )
 
         # Step 8: PCA overlay for this checkpoint.
         print("  [8/9] Plotting PCA overlay...", flush=True)
-        synth_pcs_plot = (synth_pcs if model_backend == 'genotype_conv'
-                          else compressor.transform(synth_geno.astype(np.float32)))
+        # PCA of the actual discretized canonical CSV, for ALL backends.
+        # The continuous-only PCA overlay remains at pca_overlay_continuous.png.
+        synth_pcs_plot = sampled_method_pcs[sampling_methods[0]]
         _, query_vertex_indices = _find_baq_vertices(query_pcs, ref_pcs, pop_labels)
         plot_pca_overlay(
             baq_pcs=query_pcs[:, :2],
@@ -1905,6 +2033,32 @@ def run_pipeline(data_input_paths: list,
         pd.DataFrame([variant_metrics]).to_csv(
             os.path.join(variant_metrics_dir, 'quality_metrics.csv'), index=False)
         plot_quality_metrics(metric_arrays, variant_plots_dir)
+        if evaluate:
+            # Original training may impute SNPs to fractional mean dosages.
+            # For distinct diploid genotype statistics, discretize invalid
+            # entries to the observed modal genotype at each SNP; write counts.
+            real_eval = np.array(query_geno, copy=True)
+            invalid = ~np.isin(real_eval, [0, 1, 2])
+            n_imputed_for_eval = int(invalid.sum())
+            if n_imputed_for_eval:
+                for j in np.flatnonzero(invalid.any(axis=0)):
+                    observed = real_eval[~invalid[:, j], j].astype(int)
+                    modal = np.bincount(observed, minlength=3).argmax() if len(observed) else 0
+                    real_eval[invalid[:, j], j] = modal
+            for method, method_geno in method_samples.items():
+                # Exactly one analysis per method and checkpoint, independently
+                # of how many paper figures repeat it on different SNP panels.
+                eval_root = os.path.join(variant_dir, 'paper_evaluation', method)
+                paper_metrics = evaluate_paper_analyses(
+                    real_eval.astype(np.int8), method_geno, snp_names, eval_root,
+                    seed=eval_seed, max_ld_pairs=metric_max_ld_pairs,
+                    max_distance_samples=paper_max_distance_samples,
+                    max_motif_windows=paper_max_motif_windows,
+                    max_triplets=paper_max_triplets,
+                )
+                paper_metrics['real_entries_modal_imputed_for_discrete_evaluation'] = n_imputed_for_eval
+                with open(os.path.join(eval_root, 'metrics', 'paper_analyses.json'), 'w') as fh:
+                    json.dump(paper_metrics, fh, indent=2, allow_nan=True)
 
         # Copy shared training/selection plots so each selected-model folder is self-contained.
         import shutil
@@ -1922,6 +2076,10 @@ def run_pipeline(data_input_paths: list,
             'checkpoint_state_used': state_name,
             'checkpoint_files': {label: saved_checkpoint_paths[label] for label in labels},
             'synthetic_genotypes': variant_output_path,
+            'primary_sampling_method': sampling_methods[0],
+            'checkpoint_sampling_method': checkpoint_sampling_method,
+            'sampling_methods': sampling_methods,
+            'sampling_temperature': sampling_temperature,
             'synthetic_conditioning_admixture': variant_cond_path,
             'metrics': variant_metrics,
         }
@@ -1939,6 +2097,8 @@ def run_pipeline(data_input_paths: list,
         'model_dir': model_dir,
         'best_epoch': int(best_epoch) if best_epoch is not None else None,
         'best_validation_score': float(best_score) if best_score is not None else None,
+        'checkpoint_sampling_method': checkpoint_sampling_method,
+        'sampling_methods': sampling_methods,
         'requested_saved_models': save_models,
         'resolved_saved_epochs': requested_checkpoint_epochs,
         'saved_checkpoints': saved_checkpoint_paths,
@@ -2152,7 +2312,7 @@ def build_arg_parser():
     data.add_argument('--ref_input', action='append', default=[], metavar='NAME=PATH',
                       help=('Reference genotype CSV mapping; repeat once per named dataset, exactly like '
                             '--dataset_input. Each subset size for a dataset reuses that dataset reference.'))
-    data.add_argument('--fam', required=True,
+    data.add_argument('--fam', required=False,
                       help='PLINK .fam for reference samples (ancestry labels).')
     data.add_argument('--subset_samples', type=_parse_subset_samples, default={},
                       help=("Per-dataset nested sample-size sweep. Scalars remain supported; lists create "
@@ -2161,6 +2321,14 @@ def build_arg_parser():
                             "Within each dataset, smaller n values are nested prefixes of one deterministic "
                             "random permutation. 'all' uses the complete query dataset. If --subset_samples is omitted, every requested dataset uses all rows. The reference panel "
                             "is never subset by this option."))
+    data.add_argument('--max_missing_fraction',type=float,default=None,
+                      help='Optional strict input QC cap, e.g. 0.10. Default warns but does not reject.')
+    data.add_argument('--fail_on_absent_zero',action='store_true',
+                      help='Optional strict QC: reject input with no observed genotype-0 calls.')
+    data.add_argument('--check_inputs',action='store_true',
+                      help='Audit raw query/reference input CSV values and exit without training.')
+    data.add_argument('--qc_output_dir',default='runs/genotype_qc_preflight',
+                      help='Destination for --check_inputs reports.')
     data.add_argument('--bog_baq_harmonized', action='store_true',
                       help=('Required acknowledgement before training a combined BOG+BAQ model. '
                             'This asserts allele/reference orientation and variant identities were '
@@ -2241,6 +2409,9 @@ def build_arg_parser():
                        help='Number of residual up/downsample blocks for genotype_conv.')
 
     checkpoint = parser.add_argument_group('Checkpoint selection')
+    checkpoint.add_argument('--checkpoint_sampling_method', choices=SAMPLING_METHODS, default=None,
+                            help=('Sampler used to select best checkpoint. Default: first --sampling_methods entry; '
+                                  'with no sampling_methods override this remains binomial.'))
     checkpoint.add_argument('--checkpoint_metric', choices=['composite', 'pc_mmd2'], default='composite',
                             help=('Metric minimized to select checkpoint_best.pt. composite averages bounded normalized '
                                   'MAF, heterozygosity, LD, PC-MMD and NNAA errors.'))
@@ -2259,12 +2430,81 @@ def build_arg_parser():
     metrics = parser.add_argument_group('Quality evaluation')
     metrics.add_argument('--metric_max_ld_pairs', type=int, default=2000,
                          help='Maximum sampled adjacent SNP pairs for LD r^2 fidelity metrics.')
+    metrics.add_argument('--no_evaluate', action='store_true',
+                         help='Opt out of the new paper/supplement evaluation; standard legacy plots remain.')
+    metrics.add_argument('--sampling_methods', nargs='+', choices=SAMPLING_METHODS, default=['binomial'],
+                         help='Generate the same latent/ancestry draws with one or more 0/1/2 samplers.')
+    metrics.add_argument('--sampling_temperature', type=float, default=0.35,
+                         help='Scale for categorical, ternary and ternary-normal post-processing.')
+    metrics.add_argument('--paper_max_distance_samples', type=int, default=256)
+    metrics.add_argument('--paper_max_motif_windows', type=int, default=256)
+    metrics.add_argument('--paper_max_triplets', type=int, default=2000)
+    retrospective = parser.add_argument_group('Previous-run evaluation and resampling')
+    retrospective.add_argument('--evaluate_run', default=None,
+                               help='Timestamped run or single model directory; skips training and, by default, reuses saved genotype + admixture CSV pairs without resampling.')
+    retrospective.add_argument('--resample', action='store_true',
+                               help='Regenerate dosages and sampling plots from saved weights into a separate sampling_experiments/ folder.')
+    retrospective.add_argument('--experiment_name', default=None,
+                               help='Retrospective sampler experiment folder name (must not already exist).')
+    retrospective.add_argument('--plots_only', action='store_true',
+                               help='With --resample, skip costly paper analyses, but save sampled CSVs and diagnostic plots.')
+    retrospective.add_argument('--weights', nargs='+', choices=['baseline','first','best','last'],
+                               default=['best','last','baseline','first'],
+                               help='Checkpoint states to regenerate when --resample is given; ignored when reusing saved CSVs.')
+    retrospective.add_argument('--real_input', action='append', default=[], metavar='NAME=PATH',
+                               help='Dataset filter AND CSV override in retrospective mode: repeat NAME=PATH for each desired cohort; only matching model folders are evaluated. Omit to process all cohorts using per-model args.json paths.')
+    retrospective.add_argument('--test_input', default=None,
+                               help='Independently confirmed excluded holdout cohort for exploratory train-vs-test AATS. For critic-ranking membership attacks use run_membership_attacks.py with explicit member and condition files.')
     return parser
 
 
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.evaluate_run:
+        from evaluate_saved_genotypes import evaluate_run, parse_mapping
+        results = evaluate_run(
+            args.evaluate_run, parse_mapping(args.real_input) or None,
+            args.test_input, args.resample, args.sampling_methods, args.weights,
+            args.seed, (args.n_synthetic if args.resample and any(
+                a == '--n_synthetic' or a.startswith('--n_synthetic=') for a in sys.argv[1:]) else None),
+            args.device, args.sampling_temperature, args.metric_max_ld_pairs,
+            args.paper_max_distance_samples, args.paper_max_motif_windows,
+            args.paper_max_triplets,
+            args.experiment_name, args.plots_only,
+        )
+        print('Previous-run evaluation complete:', json.dumps(results, indent=2))
+        return
+    if args.check_inputs:
+        if args.evaluate_run:parser.error('--check_inputs cannot be combined with --evaluate_run')
+        resolved_inputs=_parse_dataset_input(args.dataset_input,'--dataset_input')
+        resolved_refs=_parse_dataset_input(args.ref_input,'--ref_input')
+        if args.data_input:
+            resolved_inputs.setdefault(args.sample_name.strip().upper(),args.data_input)
+        reports=[];detailed={}
+        for name,path in resolved_inputs.items():
+            df=pd.read_csv(path)
+            arr=df.to_numpy(dtype=np.float32)
+            report=audit_genotypes(arr,dataset=name,stage='raw_query',path=path,missing_rule='negative')
+            enforce_genotype_qc(report,args.max_missing_fraction,args.fail_on_absent_zero)
+            reports.append(report);detailed[name+'_query']=(arr,list(df.columns))
+        for name,path in resolved_refs.items():
+            df=pd.read_csv(path)
+            arr=df.to_numpy(dtype=np.float32)
+            report=audit_genotypes(arr,dataset=name,stage='raw_reference',path=path,missing_rule='negative')
+            enforce_genotype_qc(report,args.max_missing_fraction,args.fail_on_absent_zero)
+            reports.append(report);detailed[name+'_reference']=(arr,list(df.columns))
+        if not reports:parser.error('--check_inputs requires --dataset_input or --data_input')
+        write_genotype_qc(args.qc_output_dir,reports,per_snp=detailed,
+                          metadata={'preflight_only':True,'imputation_performed':False})
+        print('[GENOTYPE QC] Preflight complete; no training or imputation performed.',flush=True)
+        return
+    if args.fam is None:
+        parser.error('--fam is required when training (not in --evaluate_run mode).')
+    if args.resample:
+        parser.error('--resample requires --evaluate_run.')
+    if args.sampling_temperature <= 0:
+        parser.error('--sampling_temperature must be positive.')
     if args.wgan_cond_dim != 3:
         parser.error('--wgan_cond_dim must be 3 because conditions are AFR/EUR/AMR proportions.')
     if not (0.0 <= args.val_fraction < 1.0):
@@ -2459,6 +2699,12 @@ def main():
                 device=args.device,
                 log_every=args.log_every,
                 metric_max_ld_pairs=args.metric_max_ld_pairs,
+                evaluate=not args.no_evaluate,
+                sampling_methods=args.sampling_methods,
+                sampling_temperature=args.sampling_temperature,
+                paper_max_distance_samples=args.paper_max_distance_samples,
+                paper_max_motif_windows=args.paper_max_motif_windows,
+                paper_max_triplets=args.paper_max_triplets,
                 model_backend=args.model_backend,
                 condition_source=args.condition_source,
                 condition_input_paths=condition_input_map,
@@ -2468,6 +2714,7 @@ def main():
                 conv_channels=args.conv_channels,
                 conv_blocks=args.conv_blocks,
                 checkpoint_metric=args.checkpoint_metric,
+                checkpoint_sampling_method=args.checkpoint_sampling_method,
                 checkpoint_eval_every=args.checkpoint_eval_every,
                 checkpoint_metric_max_samples=args.checkpoint_metric_max_samples,
                 checkpoint_metric_max_ld_pairs=args.checkpoint_metric_max_ld_pairs,
@@ -2475,6 +2722,8 @@ def main():
                 subset_samples=resolved_job_subset,
                 sample_name=sample_name,
                 real_color=resolved_color,
+                max_missing_fraction=args.max_missing_fraction,
+                fail_on_absent_zero=args.fail_on_absent_zero,
             )
             manifest['models'].append(result)
 
